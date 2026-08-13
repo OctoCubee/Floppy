@@ -22,7 +22,8 @@ DEFAULTS = {
     "commands_channel": None,
     "honeypot_channel": None,
     "honeypot_role": None,
-    # NOTE: XP data is stored in Discord (#floppystorage), not here.
+    "new_account_max_age_hours": 24,
+    "new_account_action": "kick",
 }
 
 def load():
