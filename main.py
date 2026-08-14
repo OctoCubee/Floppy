@@ -385,6 +385,98 @@ class Floppy(discord.Client):
             ("Member", f"{member} ({member.id})", False),
         ], footer=f"ID: {member.id}"))
 
+    async def get_honeypot_archive_thread(self, guild: discord.Guild, cfg: dict):
+        """Return/create the persistent thread used to archive honeypot attachments."""
+        channel_id = cfg.get("audit_log_channel")
+        if not channel_id:
+            state.add_log("Honeypot archive: no audit_log_channel configured")
+            return None
+
+        channel = guild.get_channel(int(channel_id))
+        if channel is None:
+            try:
+                channel = await guild.fetch_channel(int(channel_id))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                state.add_log(f"Honeypot archive: could not fetch audit channel — {e}")
+                return None
+
+        async with self.honeypot_archive_lock:
+            thread_id = cfg.get("honeypot_attachment_thread")
+            if thread_id:
+                try:
+                    thread = guild.get_thread(int(thread_id))
+                    if thread is None:
+                        thread = await guild.fetch_channel(int(thread_id))
+                    if isinstance(thread, discord.Thread):
+                        if thread.archived:
+                            try:
+                                await thread.edit(archived=False, reason="Honeypot attachment archive")
+                            except discord.HTTPException:
+                                pass
+                        return thread
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError):
+                    # The configured thread may have been deleted. Create a replacement.
+                    pass
+
+            try:
+                thread = await channel.create_thread(
+                    name="Honeypot Attachment Archive",
+                    type=discord.ChannelType.public_thread,
+                    reason="Persistent honeypot attachment archive",
+                )
+            except (discord.Forbidden, discord.HTTPException) as e:
+                state.add_log(f"Honeypot archive: failed to create thread — {e}")
+                return None
+
+            cfg["honeypot_attachment_thread"] = thread.id
+            try:
+                config.save(cfg)
+            except Exception as e:
+                state.add_log(f"Honeypot archive: failed to save thread ID — {e}")
+
+            state.add_log(f"Honeypot archive: created thread #{thread.name} ({thread.id})")
+            return thread
+
+    async def archive_honeypot_attachments(self, message: discord.Message):
+        """Upload honeypot attachments to the persistent archive before deletion.
+
+        Returns (filename, archived_attachment_url, archived_message_jump_url)
+        entries. Failures are logged but never prevent the original message from
+        being deleted.
+        """
+        if not message.attachments:
+            return []
+
+        cfg = config.load()
+        thread = await self.get_honeypot_archive_thread(message.guild, cfg)
+        if thread is None:
+            return []
+
+        archived = []
+        for attachment in message.attachments:
+            try:
+                file = await attachment.to_file(use_cached=False, spoiler=attachment.is_spoiler())
+                archive_msg = await thread.send(
+                    content=(
+                        f"**Honeypot attachment archive**\n"
+                        f"Original author: {message.author} (`{message.author.id}`)\n"
+                        f"Original channel: {message.channel.mention}\n"
+                        f"Original message: {message.jump_url}"
+                    ),
+                    file=file,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                archived_attachment = archive_msg.attachments[0] if archive_msg.attachments else None
+                if archived_attachment:
+                    archived.append((attachment.filename, archived_attachment.url, archive_msg.jump_url))
+            except (discord.Forbidden, discord.HTTPException, OSError) as e:
+                state.add_log(
+                    f"Honeypot archive: failed to archive '{attachment.filename}' "
+                    f"from {message.author} — {e}"
+                )
+
+        return archived
+
     async def on_message_delete(self, message):
         if message.author.bot or not message.guild:
             return
@@ -535,9 +627,11 @@ class Floppy(discord.Client):
 
             # 3. Delete the trigger message itself
             try:
-                await message.delete()
+                await message.delete(reason="Honeypot triggered")
             except discord.Forbidden:
-                pass
+                state.add_log(f"Honeypot: could not delete trigger message {message.id} — missing Manage Messages permission.")
+            except discord.HTTPException as e:
+                state.add_log(f"Honeypot: could not delete trigger message {message.id} — {e}")
 
             # 4. Purge everything they posted in the LAST MINUTE across the server
             asyncio.create_task(self.purge_member_recent_messages(guild, member))
