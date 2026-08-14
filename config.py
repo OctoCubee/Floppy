@@ -26,6 +26,8 @@ DEFAULTS = {
     "commands_channel": None,
     "honeypot_channel": None,
     "honeypot_role": None,
+    # Delete all messages the triggered member sent during this window.
+    "honeypot_purge_hours": 1,
     "honeypot_attachment_thread": None,
     # NOTE: XP data is stored in Discord (#floppystorage), not here.
 }

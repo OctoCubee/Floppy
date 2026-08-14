@@ -633,7 +633,8 @@ class Floppy(discord.Client):
             except discord.HTTPException as e:
                 state.add_log(f"Honeypot: could not delete trigger message {message.id} — {e}")
 
-            # 4. Purge everything they posted in the LAST MINUTE across the server
+            # 4. Purge everything they posted in the LAST HOUR across the server.
+            # Run this in the background so the trigger message is deleted immediately.
             asyncio.create_task(self.purge_member_recent_messages(guild, member))
 
             attachment_field = None
@@ -647,14 +648,14 @@ class Floppy(discord.Client):
             # 5. Log the action to your audit channel
             fields = [
                 ("User", f"{member} ({member.id})", True),
-                ("Action taken", "Assigned isolation role & queued server-wide message purge (last 60s).", True),
+                ("Action taken", "Assigned isolation role & queued server-wide message purge (last 1 hour).", True),
             ]
             if attachment_field:
                 fields.append(attachment_field)
             emb = make_embed(
                 RED,
                 "🚨 Honeypot Isolated User!",
-                description=f"{member.mention} was isolated and their messages from the last minute across all channels are being deleted.",
+                description=f"{member.mention} was isolated and their messages from the last hour across all channels are being deleted.",
                 fields=fields,
             )
             await self.log(guild, emb)
@@ -676,39 +677,71 @@ class Floppy(discord.Client):
         await levelling.handle_message(message)
 
     async def purge_member_recent_messages(self, guild: discord.Guild, member: discord.Member):
-        """Searches all text channels in the guild and deletes messages from this member sent in the last 60 seconds."""
+        """Delete every message from this member sent in the last hour across accessible text channels."""
         from datetime import timedelta
-        # Calculate time cutoff (1 minute ago)
-        one_minute_ago = datetime.now(timezone.utc) - timedelta(minutes=1)
+
+        cfg = config.load()
+        purge_hours = max(0.01, float(cfg.get("honeypot_purge_hours", 1)))
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=purge_hours)
         deleted_count = 0
+        scanned_channels = 0
 
-        state.add_log(f"Honeypot: Starting 1-minute message purge for {member}...")
+        state.add_log(f"Honeypot: Starting {purge_hours:g}-hour message purge for {member}...")
 
-        for channel in guild.text_channels:
-            # Check if the bot has permission to read history and manage messages in this channel
+        # Include normal text channels plus active public/private threads we can access.
+        channels = list(guild.text_channels)
+        try:
+            channels.extend(guild.threads)
+        except AttributeError:
+            pass
+
+        seen_ids = set()
+        for channel in channels:
+            if channel.id in seen_ids:
+                continue
+            seen_ids.add(channel.id)
+
             perms = channel.permissions_for(guild.me)
             if not perms.read_messages or not perms.manage_messages:
                 continue
 
+            scanned_channels += 1
             try:
-                # Retrieve the channel's history starting from 1 minute ago
-                # (We keep limit=150 in case they tried to mass spam a channel in that minute)
-                async for msg in channel.history(limit=150, after=one_minute_ago):
-                    if msg.author.id == member.id:
-                        try:
-                            archived = await self.archive_honeypot_attachments(msg)
-                            await msg.delete()
-                            deleted_count += 1
-                            if archived:
-                                state.add_log(
-                                    f"Honeypot: archived {len(archived)} attachment(s) from #{channel.name} before deleting a message from {member}."
-                                )
-                        except discord.HTTPException:
-                            pass
+                # limit=None is intentional: limit=150 could leave older messages behind
+                # if the member sent more than 150 messages in one channel during the hour.
+                async for msg in channel.history(limit=None, after=cutoff, oldest_first=True):
+                    if msg.author.id != member.id:
+                        continue
+
+                    try:
+                        archived = await self.archive_honeypot_attachments(msg)
+                        await msg.delete(reason="Honeypot: delete member's messages from previous hour")
+                        deleted_count += 1
+                        if archived:
+                            state.add_log(
+                                f"Honeypot: archived {len(archived)} attachment(s) from #{channel.name} before deleting a message from {member}."
+                            )
+                    except discord.NotFound:
+                        # Already deleted; don't count it as a successful purge operation.
+                        pass
+                    except discord.Forbidden as e:
+                        state.add_log(
+                            f"Honeypot purge: missing permission to delete message {msg.id} in #{channel.name} — {e}"
+                        )
+                    except discord.HTTPException as e:
+                        state.add_log(
+                            f"Honeypot purge: failed to delete message {msg.id} in #{channel.name} — {e}"
+                        )
+            except discord.Forbidden as e:
+                state.add_log(f"Honeypot purge: cannot read history in #{channel.name} — {e}")
+            except discord.HTTPException as e:
+                state.add_log(f"Honeypot purge: Discord error scanning #{channel.name} — {e}")
             except Exception as e:
                 state.add_log(f"Honeypot purge: Error scanning #{channel.name} — {e}")
 
-        state.add_log(f"Honeypot: Completed 1-minute purge for {member}. Deleted {deleted_count} messages.")
+        state.add_log(
+            f"Honeypot: Completed {purge_hours:g}-hour purge for {member}. Deleted {deleted_count} messages across {scanned_channels} channels."
+        )
 
 
 def get_bot():
