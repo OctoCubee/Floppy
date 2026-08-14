@@ -42,10 +42,9 @@ class Floppy(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.invite_cache = {}
-        # Member IDs removed automatically by the new-account protection.
-        # on_member_remove uses this to avoid sending the normal goodbye event.
-        self.auto_removed_members = set()
         self.tree = app_commands.CommandTree(self)
+        self.honeypot_archive_lock = asyncio.Lock()
+        self.auto_removed_members = set()
 
     async def setup_hook(self):
         self.add_view(OpenTicketView())
@@ -393,7 +392,7 @@ class Floppy(discord.Client):
         if message.content:
             fields.append(("Content", message.content[:1024], False))
         if message.attachments:
-            fields.append(("Attachments", "\n".join(a.filename for a in message.attachments), False))
+            fields.append(("Attachments", "\n".join(f"`{a.filename}` — {a.url}" for a in message.attachments), False))
         await self.log(message.guild, make_embed(RED, "Message Deleted", fields=fields, footer=f"Author ID: {message.author.id}"))
 
     async def on_message_edit(self, before, after):
@@ -531,24 +530,38 @@ class Floppy(discord.Client):
             if not role_added:
                 state.add_log(f"Honeypot: Triggered by {member}, but isolation role could not be applied.")
 
-            # 2. Delete the trigger message itself
+            # 2. Archive any attachments BEFORE deleting the trigger message.
+            archived_trigger = await self.archive_honeypot_attachments(message)
+
+            # 3. Delete the trigger message itself
             try:
                 await message.delete()
             except discord.Forbidden:
                 pass
 
-            # 3. Purge everything they posted in the LAST MINUTE across the server
+            # 4. Purge everything they posted in the LAST MINUTE across the server
             asyncio.create_task(self.purge_member_recent_messages(guild, member))
 
-            # 4. Log the action to your audit channel
+            attachment_field = None
+            if archived_trigger:
+                attachment_field = (
+                    "Archived Attachments",
+                    "\n".join(f"[{name}]({url}) · [archive message]({jump})" for name, url, jump in archived_trigger),
+                    False,
+                )
+
+            # 5. Log the action to your audit channel
+            fields = [
+                ("User", f"{member} ({member.id})", True),
+                ("Action taken", "Assigned isolation role & queued server-wide message purge (last 60s).", True),
+            ]
+            if attachment_field:
+                fields.append(attachment_field)
             emb = make_embed(
                 RED,
                 "🚨 Honeypot Isolated User!",
                 description=f"{member.mention} was isolated and their messages from the last minute across all channels are being deleted.",
-                fields=[
-                    ("User", f"{member} ({member.id})", True),
-                    ("Action taken", "Assigned isolation role & queued server-wide message purge (last 60s).", True),
-                ]
+                fields=fields,
             )
             await self.log(guild, emb)
             return  # Stop processing further for this message
@@ -589,8 +602,13 @@ class Floppy(discord.Client):
                 async for msg in channel.history(limit=150, after=one_minute_ago):
                     if msg.author.id == member.id:
                         try:
+                            archived = await self.archive_honeypot_attachments(msg)
                             await msg.delete()
                             deleted_count += 1
+                            if archived:
+                                state.add_log(
+                                    f"Honeypot: archived {len(archived)} attachment(s) from #{channel.name} before deleting a message from {member}."
+                                )
                         except discord.HTTPException:
                             pass
             except Exception as e:

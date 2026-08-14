@@ -24,6 +24,7 @@ DEFAULTS = {
     "commands_channel": None,
     "honeypot_channel": None,
     "honeypot_role": None,
+    "honeypot_attachment_thread": None,
 }
 
 def load():
