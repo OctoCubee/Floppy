@@ -159,6 +159,23 @@ PAGE = """
         <label>Isolation role to apply</label>
         <select id="honeypot_role" onchange="markDirty()"><option value="">— none —</option></select>
       </div>
+      <div class="field">
+        <label>Purge window (hours)</label>
+        <input id="honeypot_purge_hours" type="number" min="0.01" step="0.25" oninput="markDirty()">
+        <div class="hint">How far back to delete the triggering member's messages, server-wide. Default 1.</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">✅ Verify</div>
+      <div class="field">
+        <label>Verify channel</label>
+        <select id="verify_channel" onchange="markDirty()"><option value="">— none —</option></select>
+        <div class="hint">Anyone who sends a message here is instantly granted the role below.</div>
+      </div>
+      <div class="field">
+        <label>Role to grant</label>
+        <select id="verify_role" onchange="markDirty()"><option value="">— none —</option></select>
+      </div>
     </div>
     <div class="btn-row">
       <span class="unsaved-badge" id="unsaved-roles">⚠️ Unsaved changes</span>
@@ -439,6 +456,8 @@ PAGE = """
       populateSelect('trust_role', guildData.roles, cfg.trust_role);
       populateSelect('honeypot_channel', guildData.channels, cfg.honeypot_channel);
       populateSelect('honeypot_role', guildData.roles, cfg.honeypot_role);
+      populateSelect('verify_channel', guildData.channels, cfg.verify_channel);
+      populateSelect('verify_role', guildData.roles, cfg.verify_role);
       populateSelect('member_count_channel', guildData.voice_channels, cfg.member_count_channel);
       populateSelect('level_channel', guildData.channels, cfg.level_channel);
       populateSelect('commands_channel', guildData.channels, cfg.commands_channel);
@@ -463,6 +482,7 @@ PAGE = """
     document.getElementById('welcome_message').value = cfg.welcome_message ?? '';
     document.getElementById('goodbye_message').value = cfg.goodbye_message ?? '';
     document.getElementById('member_count_label').value = cfg.member_count_label ?? '';
+    document.getElementById('honeypot_purge_hours').value = cfg.honeypot_purge_hours ?? 1;
     updatePreview('welcome');
     updatePreview('goodbye');
     updateMemberCountPreview();
@@ -480,6 +500,9 @@ PAGE = """
       trust_role: document.getElementById('trust_role').value || null,
       honeypot_channel: document.getElementById('honeypot_channel').value || null,
       honeypot_role: document.getElementById('honeypot_role').value || null,
+      honeypot_purge_hours: parseFloat(document.getElementById('honeypot_purge_hours').value) || 1,
+      verify_channel: document.getElementById('verify_channel').value || null,
+      verify_role: document.getElementById('verify_role').value || null,
       audit_log_channel: document.getElementById('audit_log_channel').value || null,
       ticket_channel: document.getElementById('ticket_channel').value || null,
       ticket_category: document.getElementById('ticket_category').value || null,

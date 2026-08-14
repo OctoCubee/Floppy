@@ -29,6 +29,9 @@ DEFAULTS = {
     # Delete all messages the triggered member sent during this window.
     "honeypot_purge_hours": 1,
     "honeypot_attachment_thread": None,
+    # Anyone who posts in this channel is instantly granted verify_role.
+    "verify_channel": None,
+    "verify_role": None,
     # NOTE: XP data is stored in Discord (#floppystorage), not here.
 }
 

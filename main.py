@@ -4,7 +4,8 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 from itertools import cycle
-from datetime import datetime, timezone
+from collections import OrderedDict
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import state
 import config
@@ -32,6 +33,21 @@ def make_embed(color, title, description=None, fields=None, footer=None, thumbna
         e.set_footer(text=footer)
     return e
 
+_MISSING = object()
+
+
+def truncate_field(text: str, limit: int = 1024) -> str:
+    """Discord rejects the whole embed if any field value exceeds 1024 chars."""
+    if len(text) <= limit:
+        return text
+    return text[:limit - 3].rstrip() + "..."
+
+
+def safe_link_label(name: str) -> str:
+    """Square brackets in a filename would break the markdown link around it."""
+    return name.replace("[", "(").replace("]", ")")
+
+
 GREEN  = 0x43b581
 RED    = 0xf04747
 YELLOW = 0xfaa61a
@@ -45,6 +61,27 @@ class Floppy(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.honeypot_archive_lock = asyncio.Lock()
         self.auto_removed_members = set()
+        # Members with a honeypot purge currently in flight. Guards against one
+        # spammer posting 20 times and spawning 20 concurrent server-wide scans.
+        self.honeypot_active = set()
+        # Message IDs the bot deleted itself, so on_message_delete doesn't spam
+        # the audit log with one embed per purged message. Bounded to stay small.
+        self._suppressed_deletes = OrderedDict()
+
+    def suppress_delete_log(self, message_id: int):
+        self._suppressed_deletes[message_id] = None
+        while len(self._suppressed_deletes) > 2000:
+            self._suppressed_deletes.popitem(last=False)
+
+    def is_delete_suppressed(self, message_id: int) -> bool:
+        return self._suppressed_deletes.pop(message_id, _MISSING) is not _MISSING
+
+    @staticmethod
+    def get_purge_hours(cfg: dict) -> float:
+        try:
+            return max(0.01, float(cfg.get("honeypot_purge_hours", 1) or 1))
+        except (TypeError, ValueError):
+            return 1.0
 
     async def setup_hook(self):
         self.add_view(OpenTicketView())
@@ -428,27 +465,36 @@ class Floppy(discord.Client):
                 state.add_log(f"Honeypot archive: failed to create thread — {e}")
                 return None
 
+            # Re-read config immediately before writing so a dashboard save that
+            # landed while we were creating the thread isn't clobbered by the
+            # stale snapshot this function was handed.
             cfg["honeypot_attachment_thread"] = thread.id
             try:
-                config.save(cfg)
+                fresh = config.load()
+                fresh["honeypot_attachment_thread"] = thread.id
+                config.save(fresh)
             except Exception as e:
                 state.add_log(f"Honeypot archive: failed to save thread ID — {e}")
 
             state.add_log(f"Honeypot archive: created thread #{thread.name} ({thread.id})")
             return thread
 
-    async def archive_honeypot_attachments(self, message: discord.Message):
+    async def archive_honeypot_attachments(self, message: discord.Message, thread: discord.Thread = None):
         """Upload honeypot attachments to the persistent archive before deletion.
 
         Returns (filename, archived_attachment_url, archived_message_jump_url)
         entries. Failures are logged but never prevent the original message from
         being deleted.
+
+        Pass `thread` to reuse an already-resolved archive thread — the purge
+        loop does this so it isn't reloading config and re-resolving the thread
+        once per message.
         """
         if not message.attachments:
             return []
 
-        cfg = config.load()
-        thread = await self.get_honeypot_archive_thread(message.guild, cfg)
+        if thread is None:
+            thread = await self.get_honeypot_archive_thread(message.guild, config.load())
         if thread is None:
             return []
 
@@ -479,6 +525,10 @@ class Floppy(discord.Client):
 
     async def on_message_delete(self, message):
         if message.author.bot or not message.guild:
+            return
+        # Honeypot deletions are reported once in the purge summary. Without this
+        # a 200-message spammer would produce 200 separate audit embeds.
+        if self.is_delete_suppressed(message.id):
             return
         fields = [("Author", f"{message.author.mention} ({message.author})", True), ("Channel", message.channel.mention, True)]
         if message.content:
@@ -602,64 +652,21 @@ class Floppy(discord.Client):
 
         # === HONEYPOT SYSTEM ===
         honeypot_ch_id = cfg.get("honeypot_channel")
-        if honeypot_ch_id and message.channel.id == int(honeypot_ch_id):
-            member = message.author
-            guild = message.guild
-            
-            # 1. Isolate the user immediately by adding the honeypot role
-            isolation_role_id = cfg.get("honeypot_role")
-            role_added = False
-            if isolation_role_id:
-                isolation_role = guild.get_role(int(isolation_role_id))
-                if isolation_role:
-                    try:
-                        await member.add_roles(isolation_role, reason="Honeypot triggered: Isolated.")
-                        role_added = True
-                        state.add_log(f"Honeypot: Isolated {member} ({member.id}) with role.")
-                    except discord.Forbidden:
-                        state.add_log(f"Honeypot: Missing permission to assign isolation role to {member}.")
-            
-            if not role_added:
-                state.add_log(f"Honeypot: Triggered by {member}, but isolation role could not be applied.")
-
-            # 2. Archive any attachments BEFORE deleting the trigger message.
-            archived_trigger = await self.archive_honeypot_attachments(message)
-
-            # 3. Delete the trigger message itself
+        if honeypot_ch_id:
             try:
-                await message.delete()
-            except discord.Forbidden:
-                state.add_log(f"Honeypot: could not delete trigger message {message.id} — missing Manage Messages permission.")
-            except discord.HTTPException as e:
-                state.add_log(f"Honeypot: could not delete trigger message {message.id} — {e}")
-
-            # 4. Purge everything they posted in the LAST HOUR across the server.
-            # Run this in the background so the trigger message is deleted immediately.
-            asyncio.create_task(self.purge_member_recent_messages(guild, member))
-
-            attachment_field = None
-            if archived_trigger:
-                attachment_field = (
-                    "Archived Attachments",
-                    "\n".join(f"[{name}]({url}) · [archive message]({jump})" for name, url, jump in archived_trigger),
-                    False,
-                )
-
-            # 5. Log the action to your audit channel
-            fields = [
-                ("User", f"{member} ({member.id})", True),
-                ("Action taken", "Assigned isolation role & queued server-wide message purge (last 1 hour).", True),
-            ]
-            if attachment_field:
-                fields.append(attachment_field)
-            emb = make_embed(
-                RED,
-                "🚨 Honeypot Isolated User!",
-                description=f"{member.mention} was isolated and their messages from the last hour across all channels are being deleted.",
-                fields=fields,
-            )
-            await self.log(guild, emb)
-            return  # Stop processing further for this message
+                in_honeypot = message.channel.id == int(honeypot_ch_id)
+            except (TypeError, ValueError):
+                in_honeypot = False
+                state.add_log(f"Honeypot: honeypot_channel is not a valid ID ({honeypot_ch_id!r})")
+            if in_honeypot:
+                # Never let a honeypot failure escape into on_message — an
+                # uncaught error here means the trigger message survives and no
+                # purge runs, which is the exact opposite of what we want.
+                try:
+                    await self.handle_honeypot_trigger(message, cfg)
+                except Exception as e:
+                    state.add_log(f"Honeypot: unhandled error processing trigger — {e}")
+                return  # Stop processing further for this message
         # =======================
 
         # Delete any plain message in the commands channel — slash commands never
@@ -676,72 +683,269 @@ class Floppy(discord.Client):
         await handle_ticket_mention(message)
         await levelling.handle_message(message)
 
-    async def purge_member_recent_messages(self, guild: discord.Guild, member: discord.Member):
-        """Delete every message from this member sent in the last hour across accessible text channels."""
-        from datetime import timedelta
+    async def delete_quietly(self, message: discord.Message) -> bool:
+        """Delete a message without generating an audit-log embed for it."""
+        self.suppress_delete_log(message.id)
+        try:
+            await message.delete()
+            return True
+        except discord.NotFound:
+            return False
+        except discord.Forbidden:
+            state.add_log(f"Honeypot: cannot delete message {message.id} — missing Manage Messages.")
+        except discord.HTTPException as e:
+            state.add_log(f"Honeypot: failed to delete message {message.id} — {e}")
+        return False
 
-        cfg = config.load()
-        purge_hours = max(0.01, float(cfg.get("honeypot_purge_hours", 1)))
+    async def resolve_isolation_role(self, guild: discord.Guild, cfg: dict):
+        role_id = cfg.get("honeypot_role")
+        if not role_id:
+            return None
+        try:
+            role = guild.get_role(int(role_id))
+        except (TypeError, ValueError):
+            state.add_log(f"Honeypot: honeypot_role is not a valid ID ({role_id!r})")
+            return None
+        if role is None:
+            state.add_log("Honeypot: configured honeypot_role no longer exists in the guild")
+        return role
+
+    async def handle_honeypot_trigger(self, message: discord.Message, cfg: dict):
+        """Isolate, archive, delete the trigger, then purge — in that order."""
+        guild = message.guild
+        member = message.author
+
+        # message.author is a User rather than a Member if the member isn't
+        # cached. add_roles would raise AttributeError on a User.
+        if not isinstance(member, discord.Member):
+            member = guild.get_member(message.author.id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(message.author.id)
+                except discord.HTTPException as e:
+                    state.add_log(f"Honeypot: could not resolve member {message.author.id} — {e}")
+                    await self.delete_quietly(message)
+                    return
+
+        isolation_role = await self.resolve_isolation_role(guild, cfg)
+        already_isolated = isolation_role is not None and isolation_role in member.roles
+
+        # A purge is already running for them, or a previous trigger already
+        # caught them. Bin the message but don't start a second full scan.
+        if member.id in self.honeypot_active or already_isolated:
+            await self.delete_quietly(message)
+            state.add_log(f"Honeypot: {member} re-triggered; message removed, no second purge queued.")
+            return
+
+        self.honeypot_active.add(member.id)
+        try:
+            role_added = False
+            if isolation_role is not None:
+                try:
+                    await member.add_roles(isolation_role, reason="Honeypot triggered: isolated")
+                    role_added = True
+                    state.add_log(f"Honeypot: isolated {member} ({member.id}) with '{isolation_role.name}'.")
+                except discord.Forbidden:
+                    state.add_log(
+                        f"Honeypot: cannot assign isolation role to {member} — missing permission, "
+                        f"or the role sits above the bot's highest role."
+                    )
+                except discord.HTTPException as e:
+                    state.add_log(f"Honeypot: failed to assign isolation role to {member} — {e}")
+
+            if not role_added:
+                state.add_log(f"Honeypot: triggered by {member}, but isolation role was NOT applied.")
+
+            archive_thread = await self.get_honeypot_archive_thread(guild, cfg)
+            archived_trigger = await self.archive_honeypot_attachments(message, thread=archive_thread)
+            await self.delete_quietly(message)
+
+            purge_hours = self.get_purge_hours(cfg)
+
+            await self.log(guild, make_embed(
+                RED,
+                "🚨 Honeypot triggered",
+                description=f"{member.mention} tripped the honeypot. Purging their last {purge_hours:g}h server-wide — summary to follow.",
+                fields=[
+                    ("User", f"{member} ({member.id})", True),
+                    ("Isolation role", "Applied" if role_added else "⚠️ NOT applied", True),
+                ],
+                footer=f"ID: {member.id}",
+            ))
+
+            asyncio.create_task(self.purge_member_recent_messages(
+                guild, member, purge_hours, archived_trigger, role_added, archive_thread
+            ))
+        except Exception:
+            # The purge task owns the cleanup once it's scheduled; if we never
+            # got that far, release the lock here or the member is stuck.
+            self.honeypot_active.discard(member.id)
+            raise
+
+    async def collect_purge_targets(self, guild: discord.Guild):
+        """Every message-bearing channel we might need to scan, deduplicated."""
+        targets = []
+        seen = set()
+
+        def add(channel):
+            if channel.id not in seen and hasattr(channel, "history"):
+                seen.add(channel.id)
+                targets.append(channel)
+
+        for channel in guild.text_channels:
+            add(channel)
+        # Voice/stage channels carry text chat too and were previously missed.
+        for channel in getattr(guild, "voice_channels", []):
+            add(channel)
+        for channel in getattr(guild, "stage_channels", []):
+            add(channel)
+        for thread in guild.threads:
+            add(thread)
+
+        # guild.threads is only what's cached. One API call gets every active
+        # thread in the guild, including forum posts the bot never saw.
+        try:
+            for thread in await guild.active_threads():
+                add(thread)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            state.add_log(f"Honeypot purge: could not list active threads — {e}")
+
+        return targets
+
+    async def delete_message_batch(self, channel, messages, bulk_floor) -> int:
+        """Bulk-delete where possible; fall back to individual deletes."""
+        deleted = 0
+        recent = [m for m in messages if m.created_at > bulk_floor]
+        old = [m for m in messages if m.created_at <= bulk_floor]
+        can_bulk = hasattr(channel, "delete_messages")
+
+        for i in range(0, len(recent), 100):
+            chunk = recent[i:i + 100]
+            if can_bulk and len(chunk) > 1:
+                for m in chunk:
+                    self.suppress_delete_log(m.id)
+                try:
+                    await channel.delete_messages(chunk, reason="Honeypot purge")
+                    deleted += len(chunk)
+                    continue
+                except discord.NotFound:
+                    continue
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    state.add_log(
+                        f"Honeypot purge: bulk delete failed in #{channel.name}, "
+                        f"falling back to one-by-one — {e}"
+                    )
+            for m in chunk:
+                if await self.delete_quietly(m):
+                    deleted += 1
+
+        # Bulk delete refuses anything older than 14 days.
+        for m in old:
+            if await self.delete_quietly(m):
+                deleted += 1
+
+        return deleted
+
+    async def purge_member_recent_messages(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        purge_hours: float,
+        trigger_archived=None,
+        role_added: bool = True,
+        archive_thread: discord.Thread = None,
+    ):
+        """Delete every message this member sent within the purge window, server-wide."""
         cutoff = datetime.now(timezone.utc) - timedelta(hours=purge_hours)
+        bulk_floor = datetime.now(timezone.utc) - timedelta(days=14)
+
         deleted_count = 0
         scanned_channels = 0
+        skipped = []
+        archived = list(trigger_archived or [])
 
-        state.add_log(f"Honeypot: Starting {purge_hours:g}-hour message purge for {member}...")
+        state.add_log(f"Honeypot: starting {purge_hours:g}h purge for {member}...")
 
-        # Include normal text channels plus active public/private threads we can access.
-        channels = list(guild.text_channels)
         try:
-            channels.extend(guild.threads)
-        except AttributeError:
-            pass
+            if archive_thread is None:
+                archive_thread = await self.get_honeypot_archive_thread(guild, config.load())
 
-        seen_ids = set()
-        for channel in channels:
-            if channel.id in seen_ids:
-                continue
-            seen_ids.add(channel.id)
+            for channel in await self.collect_purge_targets(guild):
+                perms = channel.permissions_for(guild.me)
+                if not perms.read_messages or not perms.read_message_history:
+                    continue
+                if not perms.manage_messages:
+                    # Previously skipped in silence — staff had no idea messages
+                    # were left behind. Now it lands in the summary.
+                    skipped.append(channel)
+                    continue
 
-            perms = channel.permissions_for(guild.me)
-            if not perms.read_messages or not perms.manage_messages:
-                continue
+                scanned_channels += 1
+                try:
+                    # limit=None is intentional: a cap could leave older messages
+                    # behind if they flooded one channel during the window.
+                    victims = [
+                        m async for m in channel.history(limit=None, after=cutoff, oldest_first=True)
+                        if m.author.id == member.id
+                    ]
+                except discord.Forbidden:
+                    skipped.append(channel)
+                    continue
+                except discord.HTTPException as e:
+                    state.add_log(f"Honeypot purge: error reading #{channel.name} — {e}")
+                    continue
 
-            scanned_channels += 1
-            try:
-                # limit=None is intentional: limit=150 could leave older messages behind
-                # if the member sent more than 150 messages in one channel during the hour.
-                async for msg in channel.history(limit=None, after=cutoff, oldest_first=True):
-                    if msg.author.id != member.id:
-                        continue
+                if not victims:
+                    continue
 
-                    try:
-                        archived = await self.archive_honeypot_attachments(msg)
-                        await msg.delete(reason="Honeypot: delete member's messages from previous hour")
-                        deleted_count += 1
-                        if archived:
-                            state.add_log(
-                                f"Honeypot: archived {len(archived)} attachment(s) from #{channel.name} before deleting a message from {member}."
-                            )
-                    except discord.NotFound:
-                        # Already deleted; don't count it as a successful purge operation.
-                        pass
-                    except discord.Forbidden as e:
-                        state.add_log(
-                            f"Honeypot purge: missing permission to delete message {msg.id} in #{channel.name} — {e}"
+                for msg in victims:
+                    if msg.attachments:
+                        archived.extend(
+                            await self.archive_honeypot_attachments(msg, thread=archive_thread)
                         )
-                    except discord.HTTPException as e:
-                        state.add_log(
-                            f"Honeypot purge: failed to delete message {msg.id} in #{channel.name} — {e}"
-                        )
-            except discord.Forbidden as e:
-                state.add_log(f"Honeypot purge: cannot read history in #{channel.name} — {e}")
-            except discord.HTTPException as e:
-                state.add_log(f"Honeypot purge: Discord error scanning #{channel.name} — {e}")
-            except Exception as e:
-                state.add_log(f"Honeypot purge: Error scanning #{channel.name} — {e}")
 
-        state.add_log(
-            f"Honeypot: Completed {purge_hours:g}-hour purge for {member}. Deleted {deleted_count} messages across {scanned_channels} channels."
-        )
+                deleted_count += await self.delete_message_batch(channel, victims, bulk_floor)
+
+        except Exception as e:
+            state.add_log(f"Honeypot purge: aborted for {member} — {e}")
+        finally:
+            self.honeypot_active.discard(member.id)
+
+            fields = [
+                ("User", f"{member.mention} ({member} · {member.id})", False),
+                ("Isolation role", "Applied" if role_added else "⚠️ NOT applied", True),
+                ("Window", f"Last {purge_hours:g}h", True),
+                ("Messages deleted", str(deleted_count), True),
+                ("Channels scanned", str(scanned_channels), True),
+            ]
+            if skipped:
+                fields.append((
+                    "⚠️ Skipped — no Manage Messages",
+                    truncate_field(", ".join(f"#{c.name}" for c in skipped)),
+                    False,
+                ))
+            if archived:
+                fields.append((
+                    "Archived attachments",
+                    truncate_field("\n".join(
+                        f"[{safe_link_label(name)}]({url}) · [archive]({jump})"
+                        for name, url, jump in archived
+                    )),
+                    False,
+                ))
+
+            await self.log(guild, make_embed(
+                RED,
+                "🍯 Honeypot purge complete",
+                fields=fields,
+                footer=f"ID: {member.id}",
+            ))
+
+            state.add_log(
+                f"Honeypot: finished {purge_hours:g}h purge for {member} — "
+                f"{deleted_count} deleted across {scanned_channels} channels, "
+                f"{len(skipped)} skipped, {len(archived)} attachment(s) archived."
+            )
 
 
 def get_bot():
