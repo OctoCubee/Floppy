@@ -35,20 +35,16 @@ def make_embed(color, title, description=None, fields=None, footer=None, thumbna
 
 _MISSING = object()
 
-# How many channels the honeypot purge scans at once. High enough that a large
-# guild doesn't crawl, low enough not to burst-trip Discord's rate limiter.
-PURGE_CONCURRENCY = 5
-
 
 def truncate_field(text: str, limit: int = 1024) -> str:
-    """Discord rejects the whole embed if any field value exceeds 1024 chars."""
+    """Cap a field at Discord's 1024-char limit."""
     if len(text) <= limit:
         return text
     return text[:limit - 3].rstrip() + "..."
 
 
 def safe_link_label(name: str) -> str:
-    """Square brackets in a filename would break the markdown link around it."""
+    """Escape brackets so filenames don't break markdown links."""
     return name.replace("[", "(").replace("]", ")")
 
 
@@ -65,11 +61,9 @@ class Floppy(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.honeypot_archive_lock = asyncio.Lock()
         self.auto_removed_members = set()
-        # Members with a honeypot purge currently in flight. Guards against one
-        # spammer posting 20 times and spawning 20 concurrent server-wide scans.
+        # Members with a purge in flight, so one spammer can't spawn N scans.
         self.honeypot_active = set()
-        # Message IDs the bot deleted itself, so on_message_delete doesn't spam
-        # the audit log with one embed per purged message. Bounded to stay small.
+        # Message IDs we deleted ourselves; keeps them out of the audit log.
         self._suppressed_deletes = OrderedDict()
 
     def suppress_delete_log(self, message_id: int):
@@ -469,9 +463,7 @@ class Floppy(discord.Client):
                 state.add_log(f"Honeypot archive: failed to create thread — {e}")
                 return None
 
-            # Re-read config immediately before writing so a dashboard save that
-            # landed while we were creating the thread isn't clobbered by the
-            # stale snapshot this function was handed.
+            # Re-read so a concurrent dashboard save isn't clobbered.
             cfg["honeypot_attachment_thread"] = thread.id
             try:
                 fresh = config.load()
@@ -484,11 +476,10 @@ class Floppy(discord.Client):
             return thread
 
     async def resolve_archive_thread(self, guild: discord.Guild, cache: dict = None):
-        """Resolve the archive thread, at most once per cache dict.
+        """Resolve the archive thread once per cache dict.
 
-        Deliberately lazy: resolving can mean creating a thread, which is an API
-        round trip. Most honeypot triggers are plain text with no attachments and
-        must not pay that cost.
+        Lazy on purpose: resolving can create a thread, and most triggers have
+        no attachments.
         """
         if cache is None:
             return await self.get_honeypot_archive_thread(guild, config.load())
@@ -497,14 +488,10 @@ class Floppy(discord.Client):
         return cache["thread"]
 
     async def archive_honeypot_attachments(self, message: discord.Message, thread: discord.Thread = None, cache: dict = None):
-        """Upload honeypot attachments to the persistent archive before deletion.
+        """Archive attachments before deletion.
 
-        Returns (filename, archived_attachment_url, archived_message_jump_url)
-        entries. Failures are logged but never prevent the original message from
-        being deleted.
-
-        Pass `cache` (a plain dict, shared across one purge) so the archive thread
-        is resolved once rather than per message.
+        Returns (filename, archive_url, jump_url) tuples. Failures are logged,
+        never fatal. Share one `cache` dict across a purge.
         """
         if not message.attachments:
             return []
@@ -542,8 +529,7 @@ class Floppy(discord.Client):
     async def on_message_delete(self, message):
         if message.author.bot or not message.guild:
             return
-        # Honeypot deletions are reported once in the purge summary. Without this
-        # a 200-message spammer would produce 200 separate audit embeds.
+        # Purged messages are covered by the purge summary instead.
         if self.is_delete_suppressed(message.id):
             return
         fields = [("Author", f"{message.author.mention} ({message.author})", True), ("Channel", message.channel.mention, True)]
@@ -675,9 +661,7 @@ class Floppy(discord.Client):
                 in_honeypot = False
                 state.add_log(f"Honeypot: honeypot_channel is not a valid ID ({honeypot_ch_id!r})")
             if in_honeypot:
-                # Never let a honeypot failure escape into on_message — an
-                # uncaught error here means the trigger message survives and no
-                # purge runs, which is the exact opposite of what we want.
+                # A failure here must not leave the trigger message standing.
                 try:
                     await self.handle_honeypot_trigger(message, cfg)
                 except Exception as e:
@@ -731,8 +715,7 @@ class Floppy(discord.Client):
         guild = message.guild
         member = message.author
 
-        # message.author is a User rather than a Member if the member isn't
-        # cached. add_roles would raise AttributeError on a User.
+        # author is a User, not a Member, when uncached — add_roles would fail.
         if not isinstance(member, discord.Member):
             member = guild.get_member(message.author.id)
             if member is None:
@@ -746,8 +729,7 @@ class Floppy(discord.Client):
         isolation_role = await self.resolve_isolation_role(guild, cfg)
         already_isolated = isolation_role is not None and isolation_role in member.roles
 
-        # A purge is already running for them, or a previous trigger already
-        # caught them. Bin the message but don't start a second full scan.
+        # Already caught or mid-purge: bin the message, don't rescan.
         if member.id in self.honeypot_active or already_isolated:
             await self.delete_quietly(message)
             state.add_log(f"Honeypot: {member} re-triggered; message removed, no second purge queued.")
@@ -758,11 +740,7 @@ class Floppy(discord.Client):
             purge_hours = self.get_purge_hours(cfg)
             archive_cache = {}
 
-            # The trigger message is the only thing anyone in the channel can
-            # see, so it goes first and doesn't queue behind anything. The role
-            # add and the attachment archive run alongside it rather than in
-            # front of it — previously the message stayed visible for three
-            # sequential round trips.
+            # Trigger goes first; role and archive run alongside it.
             delete_task = asyncio.create_task(self.delete_quietly(message))
             role_task = asyncio.create_task(self.apply_isolation_role(member, isolation_role))
             archive_task = asyncio.create_task(
@@ -792,8 +770,8 @@ class Floppy(discord.Client):
                 guild, member, purge_hours, archived_trigger, role_added, archive_cache
             ))
         except Exception:
-            # The purge task owns the cleanup once it's scheduled; if we never
-            # got that far, release the lock here or the member is stuck.
+            # Purge task releases the lock once scheduled; if we never got
+            # there, release it here or the member stays stuck.
             self.honeypot_active.discard(member.id)
             raise
 
@@ -827,7 +805,7 @@ class Floppy(discord.Client):
 
         for channel in guild.text_channels:
             add(channel)
-        # Voice/stage channels carry text chat too and were previously missed.
+        # Voice/stage channels carry text chat too.
         for channel in getattr(guild, "voice_channels", []):
             add(channel)
         for channel in getattr(guild, "stage_channels", []):
@@ -835,8 +813,7 @@ class Floppy(discord.Client):
         for thread in guild.threads:
             add(thread)
 
-        # guild.threads is only what's cached. One API call gets every active
-        # thread in the guild, including forum posts the bot never saw.
+        # guild.threads is cache-only; this catches uncached forum posts.
         try:
             for thread in await guild.active_threads():
                 add(thread)
@@ -845,49 +822,21 @@ class Floppy(discord.Client):
 
         return targets
 
-    async def delete_message_batch(self, channel, messages, bulk_floor) -> int:
-        """Bulk-delete where possible; fall back to individual deletes."""
+    async def delete_message_batch(self, channel, messages) -> int:
+        """Delete one at a time, oldest first. discord.py handles pacing."""
         deleted = 0
-        recent = [m for m in messages if m.created_at > bulk_floor]
-        old = [m for m in messages if m.created_at <= bulk_floor]
-        can_bulk = hasattr(channel, "delete_messages")
-
-        for i in range(0, len(recent), 100):
-            chunk = recent[i:i + 100]
-            if can_bulk and len(chunk) > 1:
-                for m in chunk:
-                    self.suppress_delete_log(m.id)
-                try:
-                    await channel.delete_messages(chunk, reason="Honeypot purge")
-                    deleted += len(chunk)
-                    continue
-                except discord.NotFound:
-                    continue
-                except (discord.Forbidden, discord.HTTPException) as e:
-                    state.add_log(
-                        f"Honeypot purge: bulk delete failed in #{channel.name}, "
-                        f"falling back to one-by-one — {e}"
-                    )
-            for m in chunk:
-                if await self.delete_quietly(m):
-                    deleted += 1
-
-        # Bulk delete refuses anything older than 14 days.
-        for m in old:
+        for m in messages:
             if await self.delete_quietly(m):
                 deleted += 1
-
         return deleted
 
-    async def purge_channel_for_member(self, channel, member, cutoff, bulk_floor, archive_cache):
+    async def purge_channel_for_member(self, channel, member, cutoff, archive_cache):
         """Scan and clear one channel. Returns (scanned, deleted, skipped, archived)."""
         perms = channel.permissions_for(channel.guild.me)
         if not perms.read_messages or not perms.read_message_history:
             return (0, 0, None, [])
         if not perms.manage_messages:
-            # Previously skipped in silence — staff had no idea messages were
-            # left behind. Now it lands in the summary.
-            return (0, 0, channel, [])
+            return (0, 0, channel, [])  # reported in the summary
 
         try:
             # limit=None is intentional: a cap could leave older messages behind
@@ -912,7 +861,7 @@ class Floppy(discord.Client):
                     await self.archive_honeypot_attachments(msg, cache=archive_cache)
                 )
 
-        deleted = await self.delete_message_batch(channel, victims, bulk_floor)
+        deleted = await self.delete_message_batch(channel, victims)
         return (1, deleted, None, archived)
 
     async def purge_member_recent_messages(
@@ -926,7 +875,6 @@ class Floppy(discord.Client):
     ):
         """Delete every message this member sent within the purge window, server-wide."""
         cutoff = datetime.now(timezone.utc) - timedelta(hours=purge_hours)
-        bulk_floor = datetime.now(timezone.utc) - timedelta(days=14)
         if archive_cache is None:
             archive_cache = {}
 
@@ -938,25 +886,14 @@ class Floppy(discord.Client):
         state.add_log(f"Honeypot: starting {purge_hours:g}h purge for {member}...")
 
         try:
-            targets = await self.collect_purge_targets(guild)
-
-            # Scan channels in parallel. Sequentially, a 40-channel guild pays
-            # 40 round trips end to end before the last channel is even looked
-            # at; bounded concurrency keeps that near the slowest single channel
-            # without burst-tripping the rate limiter.
-            sem = asyncio.Semaphore(PURGE_CONCURRENCY)
-
-            async def run(channel):
-                async with sem:
-                    try:
-                        return await self.purge_channel_for_member(
-                            channel, member, cutoff, bulk_floor, archive_cache
-                        )
-                    except Exception as e:
-                        state.add_log(f"Honeypot purge: #{getattr(channel, 'name', '?')} failed — {e}")
-                        return (0, 0, None, [])
-
-            for scanned, deleted, skip, arch in await asyncio.gather(*(run(c) for c in targets)):
+            for channel in await self.collect_purge_targets(guild):
+                try:
+                    scanned, deleted, skip, arch = await self.purge_channel_for_member(
+                        channel, member, cutoff, archive_cache
+                    )
+                except Exception as e:
+                    state.add_log(f"Honeypot purge: #{getattr(channel, 'name', '?')} failed — {e}")
+                    continue
                 scanned_channels += scanned
                 deleted_count += deleted
                 if skip is not None:
