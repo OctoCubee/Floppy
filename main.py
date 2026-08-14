@@ -42,6 +42,9 @@ class Floppy(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.invite_cache = {}
+        # Member IDs removed automatically by the new-account protection.
+        # on_member_remove uses this to avoid sending the normal goodbye event.
+        self.auto_removed_members = set()
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
@@ -250,74 +253,55 @@ class Floppy(discord.Client):
             return
         cfg = config.load()
 
-        # Log the join immediately, before any anti-raid action. This makes sure
-        # accounts that are kicked/banned for being too new still appear as joins
-        # in the audit log.
+        # Log every join first, including accounts that will be removed immediately.
+        state.add_log(f"Member joined: {member}")
         await self.log(member.guild, make_embed(GREEN, "Member Joined", fields=[
             ("Member", f"{member.mention} ({member})", True),
             ("Account Age", f"<t:{int(member.created_at.timestamp())}:R>", True),
             ("Member #", str(member.guild.member_count), True),
         ], footer=f"ID: {member.id}"))
-        state.add_log(f"Member joined: {member}")
 
-        # Anti-raid protection: remove accounts that are too new immediately.
-        # Discord exposes the account creation time through member.created_at.
+        # Reject accounts newer than the configured age before doing any normal
+        # join processing (roles, welcome message, XP, etc.).
         max_age_hours = cfg.get("new_account_max_age_hours", 24)
-        action = str(cfg.get("new_account_action", "kick")).lower().strip()
-
+        action = str(cfg.get("new_account_action", "kick")).lower()
         try:
             max_age_hours = float(max_age_hours)
         except (TypeError, ValueError):
             max_age_hours = 24
 
-        if max_age_hours > 0:
-            account_age = datetime.now(timezone.utc) - member.created_at
-            if account_age.total_seconds() < max_age_hours * 3600:
-                age_minutes = max(0, int(account_age.total_seconds() // 60))
-                age_text = f"{age_minutes} minute(s)" if age_minutes < 120 else f"{age_minutes / 60:.1f} hour(s)"
+        account_age_hours = (datetime.now(timezone.utc) - member.created_at).total_seconds() / 3600
+        if account_age_hours < max_age_hours:
+            self.auto_removed_members.add(member.id)
+            reason = f"Account is {account_age_hours:.1f} hours old; minimum age is {max_age_hours:g} hours"
 
-                # Log the anti-raid action before removing the member.
-                action_label = "Banned" if action == "ban" else "Kicked"
-                state.add_log(
-                    f"New-account protection: {action_label.lower()} {member} "
-                    f"(account age {age_text}, threshold {max_age_hours:g}h)"
-                )
-                await self.log(member.guild, make_embed(
-                    RED,
-                    f"🛡️ New Account {action_label}",
-                    fields=[
-                        ("Member", f"{member.mention} ({member})", True),
-                        ("Account Age", f"{age_text} (<t:{int(member.created_at.timestamp())}:R>)", True),
-                        ("Threshold", f"{max_age_hours:g} hour(s)", True),
-                        ("Action", action_label, True),
-                    ],
-                    footer=f"ID: {member.id}",
-                ))
-
+            if action == "ban":
                 try:
-                    if action == "ban":
-                        await member.ban(
-                            reason=f"Automatic new-account protection: account younger than {max_age_hours:g} hours"
-                        )
-                    else:
-                        await member.kick(
-                            reason=f"Automatic new-account protection: account younger than {max_age_hours:g} hours"
-                        )
-                    await self.update_member_count(member.guild)
-                except discord.Forbidden:
-                    state.add_log(
-                        f"New-account protection: failed to {action_label.lower()} {member} "
-                        f"(missing permissions / role hierarchy)"
-                    )
+                    await member.ban(reason=reason, delete_message_days=0)
+                    state.add_log(f"New account banned: {member} — {reason}")
+                    await self.log(member.guild, make_embed(RED, "🚫 New Account Banned",
+                        fields=[
+                            ("Member", f"{member.mention} ({member})", True),
+                            ("Account Age", f"<t:{int(member.created_at.timestamp())}:R>", True),
+                            ("Minimum Age", f"{max_age_hours:g} hours", True),
+                        ], footer=f"ID: {member.id}"))
                 except discord.HTTPException as e:
-                    state.add_log(
-                        f"New-account protection: Discord API failed to {action_label.lower()} "
-                        f"{member}: {e}"
-                    )
-
-                # Do not give the account roles, welcome them, or add them to XP
-                # after the anti-raid check, even if Discord rejected the removal.
-                return
+                    self.auto_removed_members.discard(member.id)
+                    state.add_log(f"Failed to ban new account {member}: {e}")
+            else:
+                try:
+                    await member.kick(reason=reason)
+                    state.add_log(f"New account kicked: {member} — {reason}")
+                    await self.log(member.guild, make_embed(RED, "🚫 New Account Kicked",
+                        fields=[
+                            ("Member", f"{member.mention} ({member})", True),
+                            ("Account Age", f"<t:{int(member.created_at.timestamp())}:R>", True),
+                            ("Minimum Age", f"{max_age_hours:g} hours", True),
+                        ], footer=f"ID: {member.id}"))
+                except discord.HTTPException as e:
+                    self.auto_removed_members.discard(member.id)
+                    state.add_log(f"Failed to kick new account {member}: {e}")
+            return
 
         try:
             new_invites = await member.guild.fetch_invites()
@@ -356,22 +340,25 @@ class Floppy(discord.Client):
                     )
                     await channel.send(content=member.mention, embed=emb)
                 except (KeyError, IndexError) as e:
-                    # Bad custom template with an unknown {placeholder} — log, don't crash.
                     state.add_log(f"Welcome message template error: {e}")
                 except discord.HTTPException:
                     state.add_log("Welcome message: failed to send (permissions/channel?)")
 
         await self.update_member_count(member.guild)
-        # Make sure the new arrival exists in the XP table right away.
         try:
             await levelling.ensure_member_present(member.guild, member.id)
         except Exception as e:
             state.add_log(f"Levelling: failed to add joiner to XP table — {e}")
-
-
     async def on_member_remove(self, member):
         if member.bot:
             return
+
+        # A kick/ban from the new-account protection also fires on_member_remove.
+        # Do not treat that automated removal as a normal member departure.
+        if member.id in self.auto_removed_members:
+            self.auto_removed_members.discard(member.id)
+            return
+
         cfg = config.load()
         channel_id = cfg.get("goodbye_channel")
         if channel_id:

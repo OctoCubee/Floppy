@@ -8,6 +8,8 @@ DEFAULTS = {
     "welcome_message": "Welcome {mention} to {server}! 🎉",
     "goodbye_channel": None,
     "goodbye_message": "Goodbye {mention}, we'll miss you! 👋",
+    "new_account_max_age_hours": 24,
+    "new_account_action": "kick",
     "join_role": None,
     "trust_role": None,
     "audit_log_channel": None,
@@ -22,8 +24,6 @@ DEFAULTS = {
     "commands_channel": None,
     "honeypot_channel": None,
     "honeypot_role": None,
-    "new_account_max_age_hours": 24,
-    "new_account_action": "kick",
 }
 
 def load():
