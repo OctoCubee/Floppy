@@ -627,7 +627,7 @@ class Floppy(discord.Client):
 
             # 3. Delete the trigger message itself
             try:
-                await message.delete(reason="Honeypot triggered")
+                await message.delete()
             except discord.Forbidden:
                 state.add_log(f"Honeypot: could not delete trigger message {message.id} — missing Manage Messages permission.")
             except discord.HTTPException as e:
