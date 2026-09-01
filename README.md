@@ -8,4 +8,4 @@ Why Claude?
 - Less time fixing Floppy.
 - More time working on **Social Space**.
 
-It's a win-win.
+It's a win-win!
