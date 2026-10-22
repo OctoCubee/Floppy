@@ -29,11 +29,8 @@ DEFAULTS = {
     # Delete all messages the triggered member sent during this window.
     "honeypot_purge_hours": 1,
     "honeypot_attachment_thread": None,
-    # Anyone who posts in this channel is instantly granted verify_role.
-    "verify_channel": None,
-    "verify_role": None,
     # Only images/videos allowed here (text with them is fine). Text-only posts and GIFs are deleted.
-    "media_channel": None,
+    "media_channels": [],
     # NOTE: XP data is stored in Discord (#floppystorage), not here.
 }
 
@@ -46,6 +43,10 @@ def load():
     for k, v in DEFAULTS.items():
         if k not in data:
             data[k] = v
+    # Migrate the old single media_channel setting to the media_channels list.
+    legacy = data.pop("media_channel", None)
+    if legacy and not data["media_channels"]:
+        data["media_channels"] = [legacy]
     return data
 
 def save(data: dict):

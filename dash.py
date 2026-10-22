@@ -1,11 +1,10 @@
-from quart import Quart, jsonify, request, render_template_string
+from quart import Quart, Response, jsonify, request
 import state
 import config
 
 app = Quart(__name__)
 
-PAGE = """
-<!DOCTYPE html>
+PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -14,534 +13,560 @@ PAGE = """
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
-      --bg: #1e1f22; --surface: #2b2d31; --surface2: #313338;
-      --border: #3f4248; --text: #dbdee1; --muted: #949ba4;
-      --accent: #5865f2; --accent-hover: #4752c4;
-      --green: #43b581; --red: #f04747; --yellow: #faa61a;
+      color-scheme: dark;
+      --bg: #17181c; --panel: #1e2025; --raised: #26282e; --hover: #2d3037;
+      --border: #2f323a; --border-strong: #41454f;
+      --text: #e8e9ed; --muted: #9a9fab; --faint: #6c7280;
+      --accent: #6d7cff; --accent-hover: #8290ff; --accent-soft: rgba(109,124,255,.14);
+      --green: #3ec28f; --red: #ef5b5b; --amber: #f0b44c;
+      --radius: 10px;
     }
-    body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
-    .sidebar { position: fixed; top: 0; left: 0; width: 220px; height: 100vh; background: var(--surface); border-right: 1px solid var(--border); padding: 1.5rem 1rem; display: flex; flex-direction: column; gap: 0.4rem; }
-    .sidebar h1 { font-size: 1.2rem; font-weight: 700; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; }
-    .nav-item { padding: 0.6rem 0.75rem; border-radius: 8px; cursor: pointer; font-size: 0.9rem; color: var(--muted); transition: all 0.15s; display: flex; align-items: center; gap: 0.6rem; }
-    .nav-item:hover { background: var(--surface2); color: var(--text); }
-    .nav-item.active { background: var(--accent); color: white; }
-    .main { margin-left: 220px; padding: 2rem; max-width: 820px; }
+    @media (prefers-color-scheme: light) {
+      :root {
+        color-scheme: light;
+        --bg: #f4f5f7; --panel: #ffffff; --raised: #f0f1f4; --hover: #e7e9ee;
+        --border: #e1e3e8; --border-strong: #c9ccd4;
+        --text: #1b1d22; --muted: #5d6270; --faint: #8b909c;
+        --accent: #4f5ef0; --accent-hover: #3f4ed8; --accent-soft: rgba(79,94,240,.1);
+      }
+    }
+    html { scroll-behavior: smooth; }
+    body { font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; font-size: 15px; line-height: 1.45; background: var(--bg); color: var(--text); min-height: 100vh; }
+    button, input, select { font: inherit; color: inherit; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    /* ---- layout ---- */
+    .shell { display: grid; grid-template-columns: 248px minmax(0, 1fr); min-height: 100vh; }
+    .sidebar { position: sticky; top: 0; height: 100vh; background: var(--panel); border-right: 1px solid var(--border); padding: 1.25rem .75rem; display: flex; flex-direction: column; overflow-y: auto; }
+    .brand { display: flex; align-items: center; gap: .65rem; padding: 0 .5rem 1.25rem; font-weight: 700; font-size: 1.1rem; }
+    .brand-mark { width: 32px; height: 32px; border-radius: 9px; background: var(--accent); color: #fff; display: grid; place-items: center; font-size: 1rem; }
+    .nav-group { margin-bottom: 1rem; }
+    .nav-label { font-size: .7rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); padding: 0 .6rem .35rem; }
+    .nav-item { display: flex; align-items: center; gap: .6rem; width: 100%; padding: .5rem .6rem; border: 0; background: none; border-radius: 7px; color: var(--muted); cursor: pointer; text-align: left; font-size: .92rem; }
+    .nav-item:hover { background: var(--hover); color: var(--text); }
+    .nav-item[aria-current="page"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+    .nav-item svg { width: 17px; height: 17px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+    .status { margin-top: auto; padding: .75rem .6rem 0; border-top: 1px solid var(--border); font-size: .82rem; color: var(--muted); display: flex; align-items: center; gap: .55rem; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
+    .dot.on { background: var(--green); box-shadow: 0 0 0 3px rgba(62,194,143,.18); }
+    .status-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .main { padding: 2.25rem 2.5rem 7rem; max-width: 860px; width: 100%; }
     .page { display: none; }
-    .page.active { display: block; }
-    .page-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 1.5rem; flex-wrap: wrap; gap: 1rem; }
-    .page-header-left h2 { font-size: 1.4rem; font-weight: 700; margin-bottom: 0.25rem; }
-    .page-header-left .subtitle { color: var(--muted); font-size: 0.9rem; }
-    .card { background: var(--surface); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.25rem; border: 1px solid var(--border); }
-    .card-title { font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 1rem; }
-    .field { margin-bottom: 1rem; }
-    .field:last-child { margin-bottom: 0; }
-    label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.4rem; font-weight: 500; }
-    input, select { width: 100%; padding: 0.6rem 0.85rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 0.92rem; font-family: inherit; transition: border-color 0.15s; }
-    input:focus, select:focus { outline: none; border-color: var(--accent); }
-    select option { background: var(--surface2); }
-    .hint { font-size: 0.78rem; color: var(--muted); margin-top: 0.35rem; }
-    .preview { font-size: 0.85rem; background: var(--surface2); border-radius: 8px; padding: 0.75rem 1rem; margin-top: 0.5rem; border-left: 3px solid var(--accent); color: var(--text); min-height: 2rem; }
-    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
-    .btn { background: var(--accent); color: white; border: none; padding: 0.65rem 1.5rem; border-radius: 8px; font-size: 0.92rem; cursor: pointer; font-weight: 600; transition: background 0.15s; white-space: nowrap; }
-    .btn:hover { background: var(--accent-hover); }
-    .btn.secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
-    .btn.secondary:hover { background: var(--border); }
-    .btn-row { display: flex; justify-content: flex-end; gap: 0.75rem; margin-top: 1rem; align-items: center; flex-wrap: wrap; }
-    .unsaved-badge { font-size: 0.8rem; color: var(--yellow); font-weight: 600; display: none; align-items: center; gap: 0.4rem; margin-right: auto; }
-    .unsaved-badge.visible { display: flex; }
-    .toast { position: fixed; bottom: 2rem; right: 2rem; color: white; padding: 0.75rem 1.25rem; border-radius: 8px; display: none; font-size: 0.9rem; font-weight: 600; box-shadow: 0 4px 20px rgba(0,0,0,0.3); z-index: 999; background: var(--green); }
-    .toast.error { background: var(--red); }
-    .tag { display: inline-block; background: var(--accent); color: white; border-radius: 4px; padding: 0.1rem 0.4rem; font-size: 0.78rem; cursor: pointer; margin: 0.15rem; font-family: monospace; }
-    .tag:hover { background: var(--accent-hover); }
-    .multi-select { display: flex; flex-direction: column; gap: 0.4rem; max-height: 180px; overflow-y: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.5rem; }
-    .multi-select label { display: flex; align-items: center; gap: 0.5rem; font-size: 0.88rem; color: var(--text); cursor: pointer; padding: 0.3rem 0.4rem; border-radius: 6px; font-weight: normal; }
-    .multi-select label:hover { background: var(--surface2); }
-    .multi-select input[type=checkbox] { width: auto; accent-color: var(--accent); }
-    .log-list { font-family: monospace; font-size: 0.82rem; line-height: 1.7; padding: 1rem; display: flex; flex-direction: column; gap: 0.15rem; min-height: 120px; }
-    .log-line { padding: 0.2rem 0.5rem; border-radius: 4px; color: var(--muted); }
-    .log-line:hover { background: var(--surface2); color: var(--text); }
+    .page.active { display: block; animation: fade .15s ease; }
+    @keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+    .page-head { margin-bottom: 1.5rem; }
+    .page-head h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -.01em; }
+    .page-head p { color: var(--muted); margin-top: .2rem; }
+
+    /* ---- cards & settings ---- */
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 1.25rem; }
+    .card-head { padding: 1rem 1.25rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+    .card-head h2 { font-size: .95rem; font-weight: 600; }
+    .card-head p { font-size: .82rem; color: var(--muted); margin-top: .1rem; }
+    .setting { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 300px); gap: .5rem 2rem; padding: 1rem 1.25rem; align-items: start; }
+    .setting + .setting { border-top: 1px solid var(--border); }
+    .setting.stack { grid-template-columns: 1fr; }
+    .setting-title { font-weight: 550; font-size: .93rem; }
+    .setting-desc { font-size: .83rem; color: var(--muted); margin-top: .15rem; }
+
+    input[type=text], input[type=number], select {
+      width: 100%; padding: .55rem .75rem; background: var(--bg); border: 1px solid var(--border-strong); border-radius: 8px; transition: border-color .12s, box-shadow .12s;
+    }
+    input:hover, select:hover { border-color: var(--faint); }
+    input:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    select { appearance: none; padding-right: 2.1rem; cursor: pointer;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239a9fab' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+      background-repeat: no-repeat; background-position: right .75rem center; }
+    select option { background: var(--panel); color: var(--text); }
+    .unit { display: flex; align-items: center; gap: .6rem; color: var(--muted); font-size: .85rem; }
+    .unit input { max-width: 110px; }
+
+    /* ---- message editor ---- */
+    .tokens { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; margin-top: .55rem; font-size: .8rem; color: var(--muted); }
+    .token { border: 1px solid var(--border-strong); background: var(--raised); color: var(--text); border-radius: 6px; padding: .15rem .5rem; cursor: pointer; font-family: ui-monospace, Consolas, monospace; font-size: .78rem; }
+    .token:hover { border-color: var(--accent); color: var(--accent); }
+    .discord { margin-top: .85rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: .8rem 1rem; display: flex; gap: .8rem; }
+    .discord .av { width: 38px; height: 38px; border-radius: 50%; background: var(--accent); color: #fff; display: grid; place-items: center; font-weight: 700; flex: none; }
+    .discord .who { font-weight: 600; font-size: .92rem; }
+    .discord .badge { background: var(--accent); color: #fff; font-size: .62rem; font-weight: 700; padding: .05rem .3rem; border-radius: 3px; margin-left: .35rem; vertical-align: 1px; }
+    .discord .body { font-size: .92rem; overflow-wrap: anywhere; min-height: 1.3em; }
+    .mention { background: var(--accent-soft); color: var(--accent); border-radius: 3px; padding: 0 .2rem; }
+    .preview-label { font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; color: var(--faint); margin-top: .85rem; }
+
+    /* ---- multi picker ---- */
+    .picker { border: 1px solid var(--border-strong); border-radius: 8px; background: var(--bg); overflow: hidden; }
+    .picker-search { border: 0 !important; border-bottom: 1px solid var(--border) !important; border-radius: 0 !important; box-shadow: none !important; }
+    .picker-list { max-height: 190px; overflow-y: auto; padding: .25rem; }
+    .picker-list label { display: flex; align-items: center; gap: .6rem; padding: .4rem .55rem; border-radius: 6px; cursor: pointer; font-size: .9rem; }
+    .picker-list label:hover { background: var(--hover); }
+    .picker-list input { accent-color: var(--accent); width: 16px; height: 16px; }
+    .picker-foot { font-size: .75rem; color: var(--faint); padding: .35rem .7rem; border-top: 1px solid var(--border); }
+    .empty { padding: .75rem; color: var(--faint); font-size: .85rem; }
+
+    /* ---- buttons / misc ---- */
+    .btn { border: 1px solid transparent; background: var(--accent); color: #fff; padding: .5rem 1.1rem; border-radius: 8px; font-weight: 600; cursor: pointer; transition: background .12s; white-space: nowrap; }
+    .btn:hover:not(:disabled) { background: var(--accent-hover); }
+    .btn:disabled { opacity: .45; cursor: not-allowed; }
+    .btn.ghost { background: transparent; color: var(--text); border-color: var(--border-strong); }
+    .btn.ghost:hover:not(:disabled) { background: var(--hover); }
+    .btn.small { padding: .35rem .8rem; font-size: .85rem; }
+    code { background: var(--raised); border-radius: 4px; padding: .05rem .35rem; font-size: .85em; }
+    .facts { list-style: none; padding: 1rem 1.25rem; display: grid; gap: .6rem; color: var(--muted); font-size: .9rem; }
+    .facts strong { color: var(--text); font-weight: 600; }
+
+    .logs { padding: .5rem; font-family: ui-monospace, Consolas, monospace; font-size: .82rem; }
+    .log-line { padding: .35rem .6rem; border-radius: 6px; color: var(--muted); overflow-wrap: anywhere; }
+    .log-line:nth-child(odd) { background: var(--raised); }
+
+    /* ---- save bar & toast ---- */
+    .savebar { position: fixed; left: calc(248px + (100vw - 248px) / 2); bottom: 1.25rem; transform: translate(-50%, 140%); transition: transform .2s ease; background: var(--panel); border: 1px solid var(--border-strong); border-radius: 12px; padding: .6rem .6rem .6rem 1.1rem; display: flex; align-items: center; gap: 1.25rem; box-shadow: 0 10px 40px rgba(0,0,0,.35); z-index: 20; max-width: calc(100vw - 2rem); }
+    .savebar.show { transform: translate(-50%, 0); }
+    .savebar span { font-size: .9rem; display: flex; align-items: center; gap: .5rem; }
+    .savebar .dot { background: var(--amber); }
+    .savebar .actions { display: flex; gap: .5rem; }
+    .toast { position: fixed; top: 1.25rem; right: 1.25rem; background: var(--panel); border: 1px solid var(--border-strong); border-left: 3px solid var(--green); padding: .7rem 1rem; border-radius: 8px; box-shadow: 0 8px 30px rgba(0,0,0,.35); font-size: .9rem; opacity: 0; transform: translateY(-8px); pointer-events: none; transition: all .18s; z-index: 30; }
+    .toast.show { opacity: 1; transform: none; }
+    .toast.error { border-left-color: var(--red); }
+
+    /* ---- mobile ---- */
+    @media (max-width: 820px) {
+      .shell { grid-template-columns: 1fr; }
+      .sidebar { position: sticky; z-index: 10; height: auto; flex-direction: row; align-items: center; gap: .25rem; padding: .5rem; border-right: 0; border-bottom: 1px solid var(--border); overflow-x: auto; }
+      .brand { padding: 0 .5rem 0 .25rem; }
+      .brand span:last-child, .nav-label, .status { display: none; }
+      .nav-group { display: flex; margin: 0; gap: .15rem; }
+      .nav-item { width: auto; white-space: nowrap; }
+      .main { padding: 1.25rem 1rem 7rem; }
+      .setting { grid-template-columns: 1fr; }
+      .savebar { left: 50%; }
+    }
   </style>
 </head>
 <body>
+<div class="shell">
 
-<div class="sidebar">
-  <h1>🐟 Floppy</h1>
-  <div class="nav-item active" onclick="showPage('welcome', this)">👋 Welcome & Goodbye</div>
-  <div class="nav-item" onclick="showPage('roles', this)">🔖 Join Role</div>
-  <div class="nav-item" onclick="showPage('tickets', this)">🎫 Tickets</div>
-  <div class="nav-item" onclick="showPage('membercount', this)">📊 Member Count</div>
-  <div class="nav-item" onclick="showPage('levelling', this)">⬆️ Levelling</div>
-  <div class="nav-item" onclick="showPage('commands', this)">💬 Commands</div>
-  <div class="nav-item" onclick="showPage('audit', this)">📋 Audit Log</div>
-  <div class="nav-item" onclick="showPage('logs', this)">🖥️ Logs</div>
+  <nav class="sidebar" aria-label="Sections">
+    <div class="brand"><span class="brand-mark">F</span><span>Floppy</span></div>
+
+    <div class="nav-group">
+      <div class="nav-label">General</div>
+      <button class="nav-item" data-page="welcome"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>Welcome &amp; goodbye</button>
+      <button class="nav-item" data-page="roles"><svg viewBox="0 0 24 24"><path d="M20 10c0 6-8 12-8 12S4 16 4 10a8 8 0 0 1 16 0z"/><circle cx="12" cy="10" r="3"/></svg>Roles</button>
+    </div>
+    <div class="nav-group">
+      <div class="nav-label">Moderation</div>
+      <button class="nav-item" data-page="honeypot"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>Honeypot</button>
+      <button class="nav-item" data-page="media"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></svg>Media only</button>
+      <button class="nav-item" data-page="audit"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 13h8M8 17h8"/></svg>Audit log</button>
+    </div>
+    <div class="nav-group">
+      <div class="nav-label">Features</div>
+      <button class="nav-item" data-page="tickets"><svg viewBox="0 0 24 24"><path d="M2 9a3 3 0 0 1 0 6v3a1 1 0 0 0 1 1h18a1 1 0 0 0 1-1v-3a3 3 0 0 1 0-6V6a1 1 0 0 0-1-1H3a1 1 0 0 0-1 1z"/></svg>Tickets</button>
+      <button class="nav-item" data-page="levelling"><svg viewBox="0 0 24 24"><path d="m3 17 6-6 4 4 8-8M15 7h6v6"/></svg>Levelling</button>
+      <button class="nav-item" data-page="membercount"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>Member count</button>
+      <button class="nav-item" data-page="commands"><svg viewBox="0 0 24 24"><path d="m4 17 6-6-6-6M12 19h8"/></svg>Commands</button>
+    </div>
+    <div class="nav-group">
+      <div class="nav-label">Bot</div>
+      <button class="nav-item" data-page="logs"><svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>Live logs</button>
+    </div>
+
+    <div class="status"><span class="dot" id="status-dot"></span><span class="status-text" id="status-text">Connecting…</span></div>
+  </nav>
+
+  <main class="main">
+
+    <!-- WELCOME -->
+    <section class="page" id="page-welcome">
+      <div class="page-head"><h1>Welcome &amp; goodbye</h1><p>Greet new members and say farewell when they leave.</p></div>
+
+      <div class="card">
+        <div class="card-head"><div><h2>Welcome message</h2></div></div>
+        <div class="setting">
+          <div><div class="setting-title">Channel</div><div class="setting-desc">Where the welcome is posted.</div></div>
+          <select id="welcome_channel" data-src="channels"></select>
+        </div>
+        <div class="setting stack">
+          <div><div class="setting-title">Message</div></div>
+          <div>
+            <input type="text" id="welcome_message" data-preview="welcome" placeholder="Welcome {mention} to {server}! 🎉">
+            <div class="tokens">Insert
+              <button type="button" class="token" data-target="welcome_message" data-token="{mention}">{mention}</button>
+              <button type="button" class="token" data-target="welcome_message" data-token="{name}">{name}</button>
+              <button type="button" class="token" data-target="welcome_message" data-token="{server}">{server}</button>
+            </div>
+            <div class="preview-label">Preview</div>
+            <div class="discord"><div class="av">F</div><div><div class="who">Floppy<span class="badge">BOT</span></div><div class="body" id="preview-welcome"></div></div></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div><h2>Goodbye message</h2></div></div>
+        <div class="setting">
+          <div><div class="setting-title">Channel</div><div class="setting-desc">Where the goodbye is posted.</div></div>
+          <select id="goodbye_channel" data-src="channels"></select>
+        </div>
+        <div class="setting stack">
+          <div><div class="setting-title">Message</div></div>
+          <div>
+            <input type="text" id="goodbye_message" data-preview="goodbye" placeholder="Goodbye {mention}, we'll miss you! 👋">
+            <div class="tokens">Insert
+              <button type="button" class="token" data-target="goodbye_message" data-token="{mention}">{mention}</button>
+              <button type="button" class="token" data-target="goodbye_message" data-token="{name}">{name}</button>
+              <button type="button" class="token" data-target="goodbye_message" data-token="{server}">{server}</button>
+            </div>
+            <div class="preview-label">Preview</div>
+            <div class="discord"><div class="av">F</div><div><div class="who">Floppy<span class="badge">BOT</span></div><div class="body" id="preview-goodbye"></div></div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ROLES -->
+    <section class="page" id="page-roles">
+      <div class="page-head"><h1>Roles</h1><p>Automatic role handling for new and established members.</p></div>
+      <div class="card">
+        <div class="setting">
+          <div><div class="setting-title">Join role</div><div class="setting-desc">Given to everyone as soon as they join.</div></div>
+          <select id="join_role" data-src="roles"></select>
+        </div>
+        <div class="setting">
+          <div><div class="setting-title">Level 10 role</div><div class="setting-desc">At level 10 the join role is removed and this role is added instead.</div></div>
+          <select id="trust_role" data-src="roles"></select>
+        </div>
+      </div>
+    </section>
+
+    <!-- HONEYPOT -->
+    <section class="page" id="page-honeypot">
+      <div class="page-head"><h1>Honeypot</h1><p>Catch spam accounts with a channel real members never post in.</p></div>
+      <div class="card">
+        <div class="setting">
+          <div><div class="setting-title">Decoy channel</div><div class="setting-desc">The moment anyone posts here they get the isolation role and their recent messages are deleted. Hide this channel from the isolation role and lock that role out of everything else.</div></div>
+          <select id="honeypot_channel" data-src="channels"></select>
+        </div>
+        <div class="setting">
+          <div><div class="setting-title">Isolation role</div><div class="setting-desc">Applied to whoever triggers the honeypot.</div></div>
+          <select id="honeypot_role" data-src="roles"></select>
+        </div>
+        <div class="setting">
+          <div><div class="setting-title">Purge window</div><div class="setting-desc">How far back to delete that member's messages, server-wide.</div></div>
+          <div class="unit"><input type="number" id="honeypot_purge_hours" min="0.01" step="0.25"> hours</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- MEDIA -->
+    <section class="page" id="page-media">
+      <div class="page-head"><h1>Media only</h1><p>Keep picture and video channels free of chatter.</p></div>
+      <div class="card">
+        <div class="setting">
+          <div><div class="setting-title">Media channels</div><div class="setting-desc">Every post needs an image or video attached; text alongside it is fine. Text-only messages and GIFs are deleted.</div></div>
+          <div class="picker" id="media_channels" data-src="channels"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- AUDIT -->
+    <section class="page" id="page-audit">
+      <div class="page-head"><h1>Audit log</h1><p>A record of what happens in your server.</p></div>
+      <div class="card">
+        <div class="setting">
+          <div><div class="setting-title">Log channel</div><div class="setting-desc">Message edits and deletes, joins and leaves, role and nickname changes, bans, channel changes, voice activity and invites.</div></div>
+          <select id="audit_log_channel" data-src="channels"></select>
+        </div>
+      </div>
+    </section>
+
+    <!-- TICKETS -->
+    <section class="page" id="page-tickets">
+      <div class="page-head"><h1>Tickets</h1><p>Private support channels opened with a button.</p></div>
+      <div class="card">
+        <div class="card-head">
+          <div><h2>Panel</h2><p>After changing the panel channel, save and then update the panel.</p></div>
+          <button class="btn ghost small" id="repost">Update panel</button>
+        </div>
+        <div class="setting">
+          <div><div class="setting-title">Panel channel</div><div class="setting-desc">Where the “Open a ticket” button lives.</div></div>
+          <select id="ticket_channel" data-src="channels"></select>
+        </div>
+        <div class="setting">
+          <div><div class="setting-title">Ticket category</div><div class="setting-desc">New ticket channels are created under this category.</div></div>
+          <select id="ticket_category" data-src="categories"></select>
+        </div>
+        <div class="setting">
+          <div><div class="setting-title">Closed category</div><div class="setting-desc">Closed tickets move here. Leave empty to delete them instead.</div></div>
+          <select id="ticket_closed_category" data-src="categories"></select>
+        </div>
+      </div>
+      <div class="card">
+        <div class="setting">
+          <div><div class="setting-title">Staff roles</div><div class="setting-desc">These roles can see, claim and close tickets.</div></div>
+          <div class="picker" id="ticket_staff_roles" data-src="roles"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- LEVELLING -->
+    <section class="page" id="page-levelling">
+      <div class="page-head"><h1>Levelling</h1><p>Reward active members with XP and level-ups.</p></div>
+      <div class="card">
+        <div class="setting">
+          <div><div class="setting-title">Level-up channel</div><div class="setting-desc">Where level-ups are announced. Empty means the channel the message was sent in.</div></div>
+          <select id="level_channel" data-src="channels" data-empty="Same channel as the message"></select>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div><h2>How it works</h2></div></div>
+        <ul class="facts">
+          <li><strong>15–25 XP</strong> per message, at most once a minute.</li>
+          <li>Each level needs <code>5n² + 50n + 100</code> XP, so level 1 takes 155 and level 2 takes 310.</li>
+          <li>XP lives in <code>#floppystorage</code> on Discord; the bot keeps no database.</li>
+          <li>XP is wiped when a member leaves. Members check progress with <code>/rank</code>.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- MEMBER COUNT -->
+    <section class="page" id="page-membercount">
+      <div class="page-head"><h1>Member count</h1><p>Show a live member count in a voice channel name.</p></div>
+      <div class="card">
+        <div class="setting">
+          <div><div class="setting-title">Channel to rename</div><div class="setting-desc">Any voice channel. Updated on every join and leave, and every 10 minutes.</div></div>
+          <select id="member_count_channel" data-src="voice_channels"></select>
+        </div>
+        <div class="setting stack">
+          <div><div class="setting-title">Name template</div></div>
+          <div>
+            <input type="text" id="member_count_label" data-preview="membercount" placeholder="👥 Members: {count}">
+            <div class="tokens">Insert
+              <button type="button" class="token" data-target="member_count_label" data-token="{count}">{count}</button>
+            </div>
+            <div class="preview-label">Preview</div>
+            <div class="discord"><div class="body" id="preview-membercount"></div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- COMMANDS -->
+    <section class="page" id="page-commands">
+      <div class="page-head"><h1>Commands</h1><p>Keep bot commands out of general chat.</p></div>
+      <div class="card">
+        <div class="setting">
+          <div><div class="setting-title">Commands channel</div><div class="setting-desc">When set, commands only work here and other messages sent here by non-admins are deleted. Admins are exempt.</div></div>
+          <select id="commands_channel" data-src="channels" data-empty="No restriction"></select>
+        </div>
+      </div>
+    </section>
+
+    <!-- LOGS -->
+    <section class="page" id="page-logs">
+      <div class="page-head"><h1>Live logs</h1><p>The bot's last 25 events, refreshed every 5 seconds.</p></div>
+      <div class="card"><div class="logs" id="log-list"></div></div>
+    </section>
+
+  </main>
 </div>
 
-<div class="main">
-
-  <!-- WELCOME PAGE -->
-  <div class="page active" id="page-welcome">
-    <div class="page-header">
-      <div class="page-header-left">
-        <h2>👋 Welcome & Goodbye</h2>
-        <p class="subtitle">Configure join and leave messages for your server.</p>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">Welcome Message</div>
-      <div class="field">
-        <label>Channel</label>
-        <select id="welcome_channel" onchange="markDirty()"><option value="">— none —</option></select>
-      </div>
-      <div class="field">
-        <label>Message</label>
-        <input id="welcome_message" placeholder="Welcome {mention} to {server}! 🎉" oninput="updatePreview('welcome'); markDirty()">
-        <div class="hint">
-          Click to insert:
-          <span class="tag" onclick="insert('welcome_message','{mention}')"><code>{mention}</code></span>
-          <span class="tag" onclick="insert('welcome_message','{name}')"><code>{name}</code></span>
-          <span class="tag" onclick="insert('welcome_message','{server}')"><code>{server}</code></span>
-        </div>
-        <div class="preview" id="preview-welcome"></div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">Goodbye Message</div>
-      <div class="field">
-        <label>Channel</label>
-        <select id="goodbye_channel" onchange="markDirty()"><option value="">— none —</option></select>
-      </div>
-      <div class="field">
-        <label>Message</label>
-        <input id="goodbye_message" placeholder="Goodbye {mention}, we'll miss you! 👋" oninput="updatePreview('goodbye'); markDirty()">
-        <div class="hint">
-          Click to insert:
-          <span class="tag" onclick="insert('goodbye_message','{mention}')"><code>{mention}</code></span>
-          <span class="tag" onclick="insert('goodbye_message','{name}')"><code>{name}</code></span>
-          <span class="tag" onclick="insert('goodbye_message','{server}')"><code>{server}</code></span>
-        </div>
-        <div class="preview" id="preview-goodbye"></div>
-      </div>
-    </div>
-    <div class="btn-row">
-      <span class="unsaved-badge" id="unsaved-welcome">⚠️ Unsaved changes</span>
-      <button class="btn" onclick="save()">Save Changes</button>
-    </div>
+<div class="savebar" id="savebar" role="status">
+  <span><i class="dot"></i>You have unsaved changes</span>
+  <div class="actions">
+    <button class="btn ghost small" id="discard">Discard</button>
+    <button class="btn small" id="save">Save changes</button>
   </div>
-
-  <!-- ROLES PAGE -->
-  <div class="page" id="page-roles">
-    <div class="page-header">
-      <div class="page-header-left">
-        <h2>🔖 Join Role</h2>
-        <p class="subtitle">Automatically assign a role when someone joins.</p>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">Auto Role</div>
-      <div class="field">
-        <label>Role to assign on join</label>
-        <select id="join_role" onchange="markDirty()"><option value="">— none —</option></select>
-      </div>
-      <div class="field">
-        <label>Role to swap in at level 10</label>
-        <select id="trust_role" onchange="markDirty()"><option value="">— none —</option></select>
-        <div class="hint">When a member reaches level 10, the join role is removed and this role is added.</div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">🍯 Honeypot</div>
-      <div class="field">
-        <label>Decoy channel</label>
-        <select id="honeypot_channel" onchange="markDirty()"><option value="">— none —</option></select>
-        <div class="hint">A channel real members have no reason to post in. The instant anyone sends a message here, they're isolated and everything they posted today anywhere in the server is deleted. Set this channel's permissions so it's hidden from your isolation role, and lock down other channels for that role too.</div>
-      </div>
-      <div class="field">
-        <label>Isolation role to apply</label>
-        <select id="honeypot_role" onchange="markDirty()"><option value="">— none —</option></select>
-      </div>
-      <div class="field">
-        <label>Purge window (hours)</label>
-        <input id="honeypot_purge_hours" type="number" min="0.01" step="0.25" oninput="markDirty()">
-        <div class="hint">How far back to delete the triggering member's messages, server-wide. Default 1.</div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">✅ Verify</div>
-      <div class="field">
-        <label>Verify channel</label>
-        <select id="verify_channel" onchange="markDirty()"><option value="">— none —</option></select>
-        <div class="hint">Anyone who sends a message here is instantly granted the role below.</div>
-      </div>
-      <div class="field">
-        <label>Role to grant</label>
-        <select id="verify_role" onchange="markDirty()"><option value="">— none —</option></select>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">🖼️ Media only</div>
-      <div class="field">
-        <label>Media channel</label>
-        <select id="media_channel" onchange="markDirty()"><option value="">— none —</option></select>
-        <div class="hint">Posts need an image or video attached (text alongside is fine). Text-only messages and GIFs are deleted.</div>
-      </div>
-    </div>
-    <div class="btn-row">
-      <span class="unsaved-badge" id="unsaved-roles">⚠️ Unsaved changes</span>
-      <button class="btn" onclick="save()">Save Changes</button>
-    </div>
-  </div>
-
-  <!-- TICKETS PAGE -->
-  <div class="page" id="page-tickets">
-    <div class="page-header">
-      <div class="page-header-left">
-        <h2>🎫 Tickets</h2>
-        <p class="subtitle">Configure the ticket system.</p>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">Panel</div>
-      <div class="row">
-        <div class="field">
-          <label>Panel Channel</label>
-          <select id="ticket_channel" onchange="markDirty()"><option value="">— none —</option></select>
-          <div class="hint">Where the "Open a Ticket" button is posted.</div>
-        </div>
-        <div class="field">
-          <label>Ticket Category</label>
-          <select id="ticket_category" onchange="markDirty()"><option value="">— none —</option></select>
-          <div class="hint">New ticket channels go under this category.</div>
-        </div>
-        <div class="field">
-          <label>Closed Ticket Category</label>
-          <select id="ticket_closed_category" onchange="markDirty()"><option value="">— none —</option></select>
-          <div class="hint">Closed tickets are moved here instead of deleted. Leave blank to delete on close.</div>
-        </div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">Staff Roles</div>
-      <div class="field">
-        <label>Roles that can manage tickets</label>
-        <div class="multi-select" id="ticket_staff_roles"></div>
-        <div class="hint">Selected roles can see, claim, and close tickets.</div>
-      </div>
-    </div>
-    <div class="btn-row">
-      <span class="unsaved-badge" id="unsaved-tickets">⚠️ Unsaved changes</span>
-      <button class="btn secondary" onclick="repostPanel()">🔄 Update Panel</button>
-      <button class="btn" onclick="save()">Save Changes</button>
-    </div>
-  </div>
-
-  <!-- MEMBER COUNT PAGE -->
-  <div class="page" id="page-membercount">
-    <div class="page-header">
-      <div class="page-header-left">
-        <h2>📊 Member Count</h2>
-        <p class="subtitle">Display a live member count in a voice channel name.</p>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">Counter Channel</div>
-      <div class="field">
-        <label>Channel to rename</label>
-        <select id="member_count_channel" onchange="markDirty()"><option value="">— none —</option></select>
-        <div class="hint">Pick any voice channel. Its name will be updated automatically whenever someone joins or leaves (and every 10 minutes).</div>
-      </div>
-      <div class="field">
-        <label>Name template</label>
-        <input id="member_count_label" placeholder="👥 Members: {count}" oninput="updateMemberCountPreview(); markDirty()">
-        <div class="hint">
-          Click to insert: <span class="tag" onclick="insertMemberCount('{count}')"><code>{count}</code></span>
-        </div>
-        <div class="preview" id="preview-membercount"></div>
-      </div>
-    </div>
-    <div class="btn-row">
-      <span class="unsaved-badge" id="unsaved-membercount">⚠️ Unsaved changes</span>
-      <button class="btn" onclick="save()">Save Changes</button>
-    </div>
-  </div>
-
-  <!-- LEVELLING PAGE -->
-  <div class="page" id="page-levelling">
-    <div class="page-header">
-      <div class="page-header-left">
-        <h2>⬆️ Levelling</h2>
-        <p class="subtitle">Reward active members with XP and level-up announcements.</p>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">Level-up Channel</div>
-      <div class="field">
-        <label>Announce level-ups in</label>
-        <select id="level_channel" onchange="markDirty()"><option value="">— same channel as the message —</option></select>
-        <div class="hint">When a member levels up, the announcement is sent here. If left blank it posts in whatever channel the message was sent in.</div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">How it works</div>
-      <p style="font-size:0.88rem;color:var(--muted);line-height:1.6;">
-        Members earn <strong style="color:var(--text)">15–25 XP</strong> per message (once per minute, to prevent spam).
-        Level thresholds follow the formula <code style="background:var(--surface2);padding:0.1rem 0.4rem;border-radius:4px;">5n² + 50n + 100</code> — so level 1 needs 155 XP, level 2 needs 310 XP, and so on.
-        XP is stored in <code style="background:var(--surface2);padding:0.1rem 0.4rem;border-radius:4px;">#floppystorage</code> on Discord — no files or databases on the bot.
-        XP is wiped automatically when a member leaves. Members can check their progress with <code style="background:var(--surface2);padding:0.1rem 0.4rem;border-radius:4px;">/rank</code>.
-      </p>
-    </div>
-    <div class="btn-row">
-      <span class="unsaved-badge" id="unsaved-levelling">⚠️ Unsaved changes</span>
-      <button class="btn" onclick="save()">Save Changes</button>
-    </div>
-  </div>
-
-  <!-- COMMANDS PAGE -->
-  <div class="page" id="page-commands">
-    <div class="page-header">
-      <div class="page-header-left">
-        <h2>💬 Commands</h2>
-        <p class="subtitle">Restrict bot commands to a specific channel.</p>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">Commands Channel</div>
-      <div class="field">
-        <label>Restrict commands to</label>
-        <select id="commands_channel" onchange="markDirty()"><option value="">— no restriction —</option></select>
-        <div class="hint">When set, users can only run bot commands in this channel. Admins are exempt. Any plain message sent here by a non-admin will be automatically deleted.</div>
-      </div>
-    </div>
-    <div class="btn-row">
-      <span class="unsaved-badge" id="unsaved-commands">⚠️ Unsaved changes</span>
-      <button class="btn" onclick="save()">Save Changes</button>
-    </div>
-  </div>
-
-  <!-- AUDIT PAGE -->
-  <div class="page" id="page-audit">
-    <div class="page-header">
-      <div class="page-header-left">
-        <h2>📋 Audit Log</h2>
-        <p class="subtitle">Log all server activity to a channel.</p>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">Log Channel</div>
-      <div class="field">
-        <label>Send logs to</label>
-        <select id="audit_log_channel" onchange="markDirty()"><option value="">— none —</option></select>
-      </div>
-      <div class="hint" style="margin-top:0.5rem;">Logs: message edits/deletes, joins/leaves, role changes, nickname changes, bans, channel changes, voice activity, invites.</div>
-    </div>
-    <div class="btn-row">
-      <span class="unsaved-badge" id="unsaved-audit">⚠️ Unsaved changes</span>
-      <button class="btn" onclick="save()">Save Changes</button>
-    </div>
-  </div>
-
-  <!-- LOGS PAGE -->
-  <div class="page" id="page-logs">
-    <div class="page-header">
-      <div class="page-header-left">
-        <h2>🖥️ Bot Logs</h2>
-        <p class="subtitle">Last 25 bot events. Auto-refreshes every 5 seconds.</p>
-      </div>
-    </div>
-    <div class="card" style="padding:0;overflow:hidden;">
-      <div class="log-list" id="log-list"></div>
-    </div>
-  </div>
-
 </div>
-
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast" role="alert"></div>
 
 <script>
-  let guildData = { channels: [], roles: [], categories: [], voice_channels: [] };
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  const TEXT_FIELDS = ['welcome_message', 'goodbye_message', 'member_count_label'];
+  const SELECTS = [...document.querySelectorAll('select[data-src]')];
+  const PICKERS = [...document.querySelectorAll('.picker[data-src]')];
+
+  let guildData = { name: '', channels: [], roles: [], categories: [], voice_channels: [] };
   let cfg = {};
-  let currentPage = 'welcome';
+  let dirty = false;
+  let ready = false;   // guild data loaded; saving earlier would wipe every selection
 
-  function showPage(name, el) {
-    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-    document.getElementById('page-' + name).classList.add('active');
-    el.classList.add('active');
-    currentPage = name;
+  /* ---- navigation ---- */
+  function showPage(name) {
+    if (!$('page-' + name)) name = 'welcome';
+    document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.id === 'page-' + name));
+    document.querySelectorAll('.nav-item').forEach(n => {
+      if (n.dataset.page === name) n.setAttribute('aria-current', 'page');
+      else n.removeAttribute('aria-current');
+    });
+    history.replaceState(null, '', '#' + name);
+    window.scrollTo(0, 0);
   }
+  document.querySelectorAll('.nav-item').forEach(n => n.addEventListener('click', () => showPage(n.dataset.page)));
 
-  function markDirty() {
-    const badge = document.getElementById('unsaved-' + currentPage);
-    if (badge) badge.classList.add('visible');
+  /* ---- dirty state ---- */
+  function setDirty(v) {
+    dirty = v;
+    $('savebar').classList.toggle('show', v);
   }
-
-  function clearDirty() {
-    document.querySelectorAll('.unsaved-badge').forEach(b => b.classList.remove('visible'));
-  }
+  const edited = (e) => { if (e.target.closest('main') && !e.target.classList.contains('picker-search')) setDirty(true); };
+  document.addEventListener('input', edited);
+  document.addEventListener('change', edited);
+  window.addEventListener('beforeunload', (e) => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
 
   function toast(msg, error = false) {
-    const el = document.getElementById('toast');
+    const el = $('toast');
     el.textContent = msg;
-    el.className = 'toast' + (error ? ' error' : '');
-    el.style.display = 'block';
-    setTimeout(() => el.style.display = 'none', 2500);
+    el.className = 'toast show' + (error ? ' error' : '');
+    clearTimeout(toast.t);
+    toast.t = setTimeout(() => el.classList.remove('show'), 2600);
   }
 
-  function populateSelect(id, options, savedValue) {
-    const el = document.getElementById(id);
-    el.innerHTML = '<option value="">— none —</option>';
-    for (const o of options) {
-      const opt = document.createElement('option');
-      opt.value = o.id;
-      opt.textContent = o.name;
-      if (String(savedValue) === String(o.id)) opt.selected = true;
-      el.appendChild(opt);
+  /* ---- controls ---- */
+  function fillSelect(el, options, saved) {
+    const empty = el.dataset.empty || 'None';
+    el.innerHTML = `<option value="">${esc(empty)}</option>` +
+      options.map(o => `<option value="${esc(o.id)}">${esc(o.name)}</option>`).join('');
+    el.value = saved == null ? '' : String(saved);
+  }
+
+  function fillPicker(el, options, saved) {
+    const selected = new Set((saved || []).map(String));
+    el.innerHTML =
+      `<input type="text" class="picker-search" placeholder="Search…" aria-label="Search">` +
+      `<div class="picker-list">` +
+      (options.length ? options.map(o =>
+        `<label data-name="${esc(o.name.toLowerCase())}"><input type="checkbox" value="${esc(o.id)}"${selected.has(String(o.id)) ? ' checked' : ''}>${esc(o.name)}</label>`
+      ).join('') : '<div class="empty">Nothing to show yet.</div>') +
+      `</div><div class="picker-foot"></div>`;
+    updatePickerCount(el);
+  }
+
+  function updatePickerCount(el) {
+    const n = el.querySelectorAll('input[type=checkbox]:checked').length;
+    el.querySelector('.picker-foot').textContent = n ? `${n} selected` : 'None selected';
+  }
+
+  PICKERS.forEach(el => {
+    el.addEventListener('input', (e) => {
+      if (e.target.classList.contains('picker-search')) {
+        const q = e.target.value.trim().toLowerCase();
+        el.querySelectorAll('.picker-list label').forEach(l => { l.hidden = q && !l.dataset.name.includes(q); });
+      } else {
+        updatePickerCount(el);
+      }
+    });
+  });
+
+  const pickerValues = (id) => [...$(id).querySelectorAll('input[type=checkbox]:checked')].map(cb => cb.value);
+
+  /* ---- message previews ---- */
+  function renderPreview(kind) {
+    const raw = $(kind === 'membercount' ? 'member_count_label' : kind + '_message').value;
+    if (kind === 'membercount') {
+      $('preview-membercount').textContent = (raw || '👥 Members: {count}').replace(/{count}/g, '42');
+      return;
     }
-  }
-
-  function populateStaffRoles(roles, savedValues) {
-    const container = document.getElementById('ticket_staff_roles');
-    container.innerHTML = '';
-    const saved = (savedValues || []).map(String);
-    for (const role of roles) {
-      const label = document.createElement('label');
-      const cb = document.createElement('input');
-      cb.type = 'checkbox';
-      cb.value = role.id;
-      cb.checked = saved.includes(String(role.id));
-      cb.onchange = markDirty;
-      label.appendChild(cb);
-      label.appendChild(document.createTextNode(role.name));
-      container.appendChild(label);
-    }
-  }
-
-  function updateMemberCountPreview() {
-    const msg = document.getElementById('member_count_label').value || '👥 Members: {count}';
-    document.getElementById('preview-membercount').textContent = msg.replace(/{count}/g, '42');
-  }
-
-  function insertMemberCount(text) {
-    const el = document.getElementById('member_count_label');
-    const start = el.selectionStart, end = el.selectionEnd;
-    el.value = el.value.substring(0, start) + text + el.value.substring(end);
-    el.selectionStart = el.selectionEnd = start + text.length;
-    el.focus();
-    updateMemberCountPreview();
-    markDirty();
-  }
-
-  function insert(fieldId, text) {
-    const el = document.getElementById(fieldId);
-    const start = el.selectionStart, end = el.selectionEnd;
-    el.value = el.value.substring(0, start) + text + el.value.substring(end);
-    el.selectionStart = el.selectionEnd = start + text.length;
-    el.focus();
-    updatePreview(fieldId.includes('welcome') ? 'welcome' : 'goodbye');
-    markDirty();
-  }
-
-  function updatePreview(type) {
-    const msg = document.getElementById(type + '_message').value;
-    document.getElementById('preview-' + type).textContent = msg
-      .replace(/{mention}/g, '@YourName')
+    const server = guildData.name || 'Your Server';
+    $('preview-' + kind).innerHTML = esc(raw)
+      .replace(/{mention}/g, '<span class="mention">@YourName</span>')
       .replace(/{name}/g, 'YourName')
-      .replace(/{server}/g, 'Social Space');
+      .replace(/{server}/g, esc(server));
+  }
+  document.querySelectorAll('input[data-preview]').forEach(el =>
+    el.addEventListener('input', () => renderPreview(el.dataset.preview)));
+
+  document.addEventListener('click', (e) => {
+    const t = e.target.closest('.token');
+    if (!t) return;
+    const el = $(t.dataset.target), tok = t.dataset.token;
+    const s = el.selectionStart ?? el.value.length, en = el.selectionEnd ?? el.value.length;
+    el.value = el.value.slice(0, s) + tok + el.value.slice(en);
+    el.selectionStart = el.selectionEnd = s + tok.length;
+    el.focus();
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+
+  /* ---- data ---- */
+  function applyConfig() {
+    TEXT_FIELDS.forEach(id => { $(id).value = cfg[id] ?? ''; });
+    $('honeypot_purge_hours').value = cfg.honeypot_purge_hours ?? 1;
+    SELECTS.forEach(el => fillSelect(el, guildData[el.dataset.src], cfg[el.id]));
+    PICKERS.forEach(el => fillPicker(el, guildData[el.dataset.src], cfg[el.id]));
+    renderPreview('welcome'); renderPreview('goodbye'); renderPreview('membercount');
+  }
+
+  function setStatus(online) {
+    $('status-dot').classList.toggle('on', online);
+    $('status-text').textContent = online ? (guildData.name || 'Bot online') : 'Bot offline';
   }
 
   async function fetchGuild() {
     try {
-      const res = await fetch('/api/guild');
-      const data = await res.json();
-      if (!data.channels.length) return; // bot not ready yet, try again later
+      const data = await (await fetch('/api/guild')).json();
+      if (!data.channels.length) return setStatus(false);
+      const first = !ready;
       guildData = data;
-      populateSelect('welcome_channel', guildData.channels, cfg.welcome_channel);
-      populateSelect('goodbye_channel', guildData.channels, cfg.goodbye_channel);
-      populateSelect('audit_log_channel', guildData.channels, cfg.audit_log_channel);
-      populateSelect('ticket_channel', guildData.channels, cfg.ticket_channel);
-      populateSelect('ticket_category', guildData.categories, cfg.ticket_category);
-      populateSelect('ticket_closed_category', guildData.categories, cfg.ticket_closed_category);
-      populateSelect('join_role', guildData.roles, cfg.join_role);
-      populateSelect('trust_role', guildData.roles, cfg.trust_role);
-      populateSelect('honeypot_channel', guildData.channels, cfg.honeypot_channel);
-      populateSelect('honeypot_role', guildData.roles, cfg.honeypot_role);
-      populateSelect('verify_channel', guildData.channels, cfg.verify_channel);
-      populateSelect('verify_role', guildData.roles, cfg.verify_role);
-      populateSelect('media_channel', guildData.channels, cfg.media_channel);
-      populateSelect('member_count_channel', guildData.voice_channels, cfg.member_count_channel);
-      populateSelect('level_channel', guildData.channels, cfg.level_channel);
-      populateSelect('commands_channel', guildData.channels, cfg.commands_channel);
-      populateStaffRoles(guildData.roles, cfg.ticket_staff_roles);
-    } catch(e) {}
+      setStatus(true);
+      ready = true;
+      $('save').disabled = false;
+      if (first || !dirty) applyConfig();   // never overwrite edits in progress
+    } catch (e) { setStatus(false); }
   }
 
   async function fetchLogs() {
     try {
-      const res = await fetch('/api/logs');
-      const data = await res.json();
-      const list = document.getElementById('log-list');
-      list.innerHTML = data.logs.length
-        ? data.logs.map(l => `<div class="log-line">${l}</div>`).join('')
-        : '<div class="log-line">No logs yet...</div>';
-    } catch(e) {}
+      const data = await (await fetch('/api/logs')).json();
+      $('log-list').innerHTML = data.logs.length
+        ? data.logs.map(l => `<div class="log-line">${esc(l)}</div>`).join('')
+        : '<div class="empty">No events yet.</div>';
+    } catch (e) {}
   }
 
   async function load() {
-    const res = await fetch('/api/config');
-    cfg = await res.json();
-    document.getElementById('welcome_message').value = cfg.welcome_message ?? '';
-    document.getElementById('goodbye_message').value = cfg.goodbye_message ?? '';
-    document.getElementById('member_count_label').value = cfg.member_count_label ?? '';
-    document.getElementById('honeypot_purge_hours').value = cfg.honeypot_purge_hours ?? 1;
-    updatePreview('welcome');
-    updatePreview('goodbye');
-    updateMemberCountPreview();
+    cfg = await (await fetch('/api/config')).json();
+    applyConfig();
     await fetchGuild();
+    setDirty(false);
   }
 
   async function save() {
-    const staffRoles = [...document.querySelectorAll('#ticket_staff_roles input:checked')].map(cb => cb.value);
-    const body = {
-      welcome_channel: document.getElementById('welcome_channel').value || null,
-      welcome_message: document.getElementById('welcome_message').value || null,
-      goodbye_channel: document.getElementById('goodbye_channel').value || null,
-      goodbye_message: document.getElementById('goodbye_message').value || null,
-      join_role: document.getElementById('join_role').value || null,
-      trust_role: document.getElementById('trust_role').value || null,
-      honeypot_channel: document.getElementById('honeypot_channel').value || null,
-      honeypot_role: document.getElementById('honeypot_role').value || null,
-      honeypot_purge_hours: parseFloat(document.getElementById('honeypot_purge_hours').value) || 1,
-      verify_channel: document.getElementById('verify_channel').value || null,
-      verify_role: document.getElementById('verify_role').value || null,
-      media_channel: document.getElementById('media_channel').value || null,
-      audit_log_channel: document.getElementById('audit_log_channel').value || null,
-      ticket_channel: document.getElementById('ticket_channel').value || null,
-      ticket_category: document.getElementById('ticket_category').value || null,
-      ticket_closed_category: document.getElementById('ticket_closed_category').value || null,
-      ticket_staff_roles: staffRoles,
-      member_count_channel: document.getElementById('member_count_channel').value || null,
-      member_count_label: document.getElementById('member_count_label').value || null,
-      level_channel: document.getElementById('level_channel').value || null,
-      commands_channel: document.getElementById('commands_channel').value || null,
-    };
-    const res = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    if (res.ok) {
+    if (!ready) return toast('Bot is not connected yet', true);
+    const body = {};
+    TEXT_FIELDS.forEach(id => { body[id] = $(id).value || null; });
+    SELECTS.forEach(el => { body[el.id] = el.value || null; });
+    PICKERS.forEach(el => { body[el.id] = pickerValues(el.id); });
+    body.honeypot_purge_hours = parseFloat($('honeypot_purge_hours').value) || 1;
+
+    $('save').disabled = true;
+    try {
+      const res = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (!res.ok) throw new Error();
       cfg = { ...cfg, ...body };
-      clearDirty();
-      if (body.member_count_channel) {
-        await fetch('/api/sync-member-count', { method: 'POST' });
-      }
-      toast('✅ Saved!');
-    } else {
-      toast('❌ Save failed', true);
+      setDirty(false);
+      if (body.member_count_channel) await fetch('/api/sync-member-count', { method: 'POST' });
+      toast('Changes saved');
+    } catch (e) {
+      toast('Save failed', true);
     }
+    $('save').disabled = false;
   }
 
-  async function repostPanel() {
-    const res = await fetch('/api/repost-panel', { method: 'POST' });
-    if (res.ok) toast('✅ Panel updated!');
-    else toast('❌ Failed — is the bot online?', true);
-  }
+  $('save').addEventListener('click', save);
+  $('discard').addEventListener('click', () => { applyConfig(); setDirty(false); });
+  $('repost').addEventListener('click', async () => {
+    const res = await fetch('/api/repost-panel', { method: 'POST' }).catch(() => null);
+    if (res && res.ok) toast('Ticket panel updated');
+    else toast('Failed. Is the bot online?', true);
+  });
+  document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); if (dirty) save(); }
+  });
 
+  $('save').disabled = true;
+  showPage(location.hash.slice(1) || 'welcome');
   load();
   fetchLogs();
   setInterval(fetchGuild, 30000);
@@ -553,19 +578,19 @@ PAGE = """
 
 @app.route("/")
 async def index():
-    return await render_template_string(PAGE)
+    return Response(PAGE, mimetype="text/html")
 
 @app.route("/api/guild")
 async def guild():
     bot = state.bot
     if not bot or not bot.guilds:
-        return jsonify({"channels": [], "roles": [], "categories": []})
+        return jsonify({"name": "", "channels": [], "roles": [], "categories": [], "voice_channels": []})
     g = bot.guilds[0]
     channels = [{"id": str(c.id), "name": f"# {c.name}"} for c in sorted(g.text_channels, key=lambda c: c.position)]
     voice_channels = [{"id": str(c.id), "name": f"🔊 {c.name}"} for c in sorted(g.voice_channels, key=lambda c: c.position)]
     roles = [{"id": str(r.id), "name": r.name} for r in sorted(g.roles, key=lambda r: -r.position) if r.name != "@everyone"]
     categories = [{"id": str(c.id), "name": c.name} for c in sorted(g.categories, key=lambda c: c.position)]
-    return jsonify({"channels": channels, "roles": roles, "categories": categories, "voice_channels": voice_channels})
+    return jsonify({"name": g.name, "channels": channels, "roles": roles, "categories": categories, "voice_channels": voice_channels})
 
 @app.route("/api/config", methods=["GET"])
 async def get_config():

@@ -623,36 +623,9 @@ class Floppy(discord.Client):
         elif before.channel != after.channel:
             await self.log(member.guild, make_embed(YELLOW, "Switched Voice", fields=[("Member", f"{member.mention} ({member})", True), ("From", before.channel.name, True), ("To", after.channel.name, True)], footer=f"ID: {member.id}"))
 
-    async def handle_verify_message(self, message: discord.Message, cfg: dict):
-        """Instantly grant a role to anyone who sends a message in the verify channel."""
-        channel_id = cfg.get("verify_channel")
-        role_id = cfg.get("verify_role")
-        if not channel_id or not role_id or message.channel.id != int(channel_id):
-            return
-
-        role = message.guild.get_role(int(role_id))
-        if role is None:
-            state.add_log("Verify: configured verify_role not found in guild")
-            return
-
-        if role in message.author.roles:
-            return  # already has it, nothing to do
-
-        try:
-            await message.author.add_roles(role, reason="Sent a message in the verify channel")
-            state.add_log(f"Verify: granted '{role.name}' to {message.author} via #{message.channel.name}")
-        except discord.Forbidden:
-            state.add_log("Verify: missing permissions to add verify role")
-        except discord.HTTPException as e:
-            state.add_log(f"Verify: failed to add role — {e}")
-
     async def handle_media_only(self, message: discord.Message, cfg: dict) -> bool:
-        """In the media channel, delete text-only posts and GIFs. Returns True if deleted."""
-        channel_id = cfg.get("media_channel")
-        try:
-            if not channel_id or message.channel.id != int(channel_id):
-                return False
-        except (TypeError, ValueError):
+        """In the media channels, delete text-only posts and GIFs. Returns True if deleted."""
+        if str(message.channel.id) not in [str(c) for c in cfg.get("media_channels", [])]:
             return False
 
         def is_gif(a: discord.Attachment) -> bool:
@@ -708,7 +681,6 @@ class Floppy(discord.Client):
         if await self.handle_media_only(message, cfg):
             return
 
-        await self.handle_verify_message(message, cfg)
         await handle_ticket_mention(message)
         await levelling.handle_message(message)
 
