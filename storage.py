@@ -150,6 +150,17 @@ async def _find_table_message(channel: discord.TextChannel, table: str) -> disco
     return None
 
 
+async def _ensure_pinned(msg: discord.Message):
+    """Pin a table's live message so it's easy to find (needs Manage Messages)."""
+    if msg.pinned:
+        return
+    try:
+        await msg.pin(reason="Floppy live storage message")
+    except discord.HTTPException as e:
+        # Pin limit (50) reached or missing perms — not worth failing a write over.
+        state.add_log(f"Storage: couldn't pin '{msg.id}' — {e}")
+
+
 async def _post_backup(guild: discord.Guild, table: str, data: dict):
     """Append a snapshot to #floppystoragebackup. Never called if backup channel is unavailable."""
     backup_channel = await _get_or_create_backup_channel(guild)
@@ -185,6 +196,7 @@ async def read(guild: discord.Guild, table: str) -> dict:
 
     # Hold a reference to this message — we'll edit it forever instead of replacing it.
     _live_msgs[table] = msg
+    await _ensure_pinned(msg)
 
     try:
         raw = await msg.attachments[0].read()
@@ -246,7 +258,11 @@ async def write(guild: discord.Guild, table: str, data: dict):
         # Edit the existing message in-place — zero chance of duplicates.
         try:
             file = discord.File(io.BytesIO(raw), filename=f"{table}.json")
-            await live_msg.edit(content=content_text, attachments=[file])
+            # edit() returns the updated message; the old object still points at the
+            # replaced (now 404) attachment, so keep the fresh one for the next merge.
+            live_msg = await live_msg.edit(content=content_text, attachments=[file])
+            _live_msgs[table] = live_msg
+            await _ensure_pinned(live_msg)
             state.add_log(f"Storage: edited '{table}' (msg {live_msg.id})")
         except discord.NotFound:
             # Message was manually deleted — fall through to re-create it.
@@ -263,6 +279,7 @@ async def write(guild: discord.Guild, table: str, data: dict):
             file = discord.File(io.BytesIO(raw), filename=f"{table}.json")
             new_msg = await channel.send(content=content_text, file=file)
             _live_msgs[table] = new_msg
+            await _ensure_pinned(new_msg)
             state.add_log(f"Storage: created live message for '{table}' (msg {new_msg.id})")
         except Exception as e:
             state.add_log(f"Storage: failed to create message for '{table}' — {e}")

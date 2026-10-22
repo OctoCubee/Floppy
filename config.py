@@ -32,6 +32,8 @@ DEFAULTS = {
     # Anyone who posts in this channel is instantly granted verify_role.
     "verify_channel": None,
     "verify_role": None,
+    # Only images/videos allowed here (text with them is fine). Text-only posts and GIFs are deleted.
+    "media_channel": None,
     # NOTE: XP data is stored in Discord (#floppystorage), not here.
 }
 

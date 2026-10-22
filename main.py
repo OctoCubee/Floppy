@@ -646,6 +646,32 @@ class Floppy(discord.Client):
         except discord.HTTPException as e:
             state.add_log(f"Verify: failed to add role — {e}")
 
+    async def handle_media_only(self, message: discord.Message, cfg: dict) -> bool:
+        """In the media channel, delete text-only posts and GIFs. Returns True if deleted."""
+        channel_id = cfg.get("media_channel")
+        try:
+            if not channel_id or message.channel.id != int(channel_id):
+                return False
+        except (TypeError, ValueError):
+            return False
+
+        def is_gif(a: discord.Attachment) -> bool:
+            return (a.content_type or "").lower() == "image/gif" or a.filename.lower().endswith(".gif")
+
+        def is_media(a: discord.Attachment) -> bool:
+            ctype = (a.content_type or "").lower()
+            return ctype.startswith(("image/", "video/")) and not is_gif(a)
+
+        ok = (
+            any(is_media(a) for a in message.attachments)
+            and not any(is_gif(a) for a in message.attachments)
+        )
+        if ok:
+            return False
+
+        await self.delete_quietly(message)
+        return True
+
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
             return
@@ -677,6 +703,9 @@ class Floppy(discord.Client):
                 await message.delete()
             except discord.Forbidden:
                 pass
+            return
+
+        if await self.handle_media_only(message, cfg):
             return
 
         await self.handle_verify_message(message, cfg)

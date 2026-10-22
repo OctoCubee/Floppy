@@ -177,6 +177,14 @@ PAGE = """
         <select id="verify_role" onchange="markDirty()"><option value="">— none —</option></select>
       </div>
     </div>
+    <div class="card">
+      <div class="card-title">🖼️ Media only</div>
+      <div class="field">
+        <label>Media channel</label>
+        <select id="media_channel" onchange="markDirty()"><option value="">— none —</option></select>
+        <div class="hint">Posts need an image or video attached (text alongside is fine). Text-only messages and GIFs are deleted.</div>
+      </div>
+    </div>
     <div class="btn-row">
       <span class="unsaved-badge" id="unsaved-roles">⚠️ Unsaved changes</span>
       <button class="btn" onclick="save()">Save Changes</button>
@@ -458,6 +466,7 @@ PAGE = """
       populateSelect('honeypot_role', guildData.roles, cfg.honeypot_role);
       populateSelect('verify_channel', guildData.channels, cfg.verify_channel);
       populateSelect('verify_role', guildData.roles, cfg.verify_role);
+      populateSelect('media_channel', guildData.channels, cfg.media_channel);
       populateSelect('member_count_channel', guildData.voice_channels, cfg.member_count_channel);
       populateSelect('level_channel', guildData.channels, cfg.level_channel);
       populateSelect('commands_channel', guildData.channels, cfg.commands_channel);
@@ -503,6 +512,7 @@ PAGE = """
       honeypot_purge_hours: parseFloat(document.getElementById('honeypot_purge_hours').value) || 1,
       verify_channel: document.getElementById('verify_channel').value || null,
       verify_role: document.getElementById('verify_role').value || null,
+      media_channel: document.getElementById('media_channel').value || null,
       audit_log_channel: document.getElementById('audit_log_channel').value || null,
       ticket_channel: document.getElementById('ticket_channel').value || null,
       ticket_category: document.getElementById('ticket_category').value || null,
