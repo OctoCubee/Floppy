@@ -642,7 +642,14 @@ class Floppy(discord.Client):
         if ok:
             return False
 
-        await self.delete_quietly(message)
+        if await self.delete_quietly(message):
+            fields = [("Author", f"{message.author.mention} ({message.author})", True), ("Channel", message.channel.mention, True),
+                      ("Reason", "Media-only channel: text-only or GIF post", False)]
+            if message.content:
+                fields.append(("Content", message.content[:1024], False))
+            if message.attachments:
+                fields.append(("Attachments", "\n".join(f"`{a.filename}` — {a.url}" for a in message.attachments), False))
+            await self.log(message.guild, make_embed(RED, "Message Deleted", fields=fields, footer=f"Author ID: {message.author.id}"))
         return True
 
     async def on_message(self, message: discord.Message):
