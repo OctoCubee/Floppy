@@ -161,11 +161,11 @@ async def apply_trust_role(member: discord.Member, cfg: dict | None = None):
 
     try:
         if trust_role.id not in member_role_ids:
-            await member.add_roles(trust_role, reason="Reached level 10")
+            await member.add_roles(trust_role, reason=f"Reached level {TRUST_LEVEL}")
         if join_role_id:
             join_role = member.guild.get_role(int(join_role_id))
             if join_role and join_role.id in member_role_ids:
-                await member.remove_roles(join_role, reason="Reached level 10 — removing join role")
+                await member.remove_roles(join_role, reason=f"Reached level {TRUST_LEVEL} — removing join role")
     except discord.Forbidden:
         state.add_log("Levelling: missing permissions to swap level-10 role")
     except discord.HTTPException:
@@ -191,7 +191,7 @@ async def revoke_trust_role(member: discord.Member, cfg: dict | None = None):
         return  # nothing to do
 
     try:
-        await member.remove_roles(trust_role, reason="Set below level 10")
+        await member.remove_roles(trust_role, reason=f"Set below level {TRUST_LEVEL}")
     except discord.Forbidden:
         state.add_log("Levelling: missing permissions to remove level-10 role")
     except discord.HTTPException:
@@ -305,8 +305,8 @@ async def grant_tenure_trust(guild: discord.Guild):
     now = datetime.now(timezone.utc)
 
     # --- Pass 1: collect everyone who qualifies, no Discord writes yet --------
-    # Doing a write per member hammers the storage channel (one message edit +
-    # backup snapshot each) and the role API, which trips Discord's 429 rate
+    # Doing a write per member hammers the storage channel (one message edit
+    # each) and the role API, which trips Discord's 429 rate
     # limiter. So we gather first, then persist in one shot and assign in
     # throttled batches.
     qualifying = []

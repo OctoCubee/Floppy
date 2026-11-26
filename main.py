@@ -13,7 +13,6 @@ import storage
 import commands
 import levelling
 from tickets import OpenTicketView, TicketPanelView, handle_ticket_mention
-from storage import RestoreBackupButton, KNOWN_TABLES
 
 load_dotenv()
 
@@ -65,6 +64,19 @@ class Floppy(discord.Client):
         self.honeypot_active = set()
         # Message IDs we deleted ourselves; keeps them out of the audit log.
         self._suppressed_deletes = OrderedDict()
+        # Guild IDs whose startup data load has already run. on_ready fires
+        # again after every reconnect, and the heavy work only needs to run once.
+        self._startup_done = set()
+        # Pending debounced member-count renames, keyed by guild ID.
+        self._member_count_tasks = {}
+
+    async def close(self):
+        # Push any batched storage writes before disconnecting.
+        try:
+            await storage.flush_all()
+        except Exception as e:
+            state.add_log(f"Storage: flush on shutdown failed — {e}")
+        await super().close()
 
     def suppress_delete_log(self, message_id: int):
         self._suppressed_deletes[message_id] = None
@@ -86,9 +98,6 @@ class Floppy(discord.Client):
         self.add_view(TicketPanelView())
         from staff_panel import StaffPanelView
         self.add_view(StaffPanelView())
-        # Register one persistent RestoreBackupButton view per known table
-        for table in KNOWN_TABLES:
-            self.add_view(RestoreBackupButton(table))
         self.cycle_status.start()
         self.update_member_count_task.start()
         self.tenure_trust_task.start()
@@ -99,20 +108,37 @@ class Floppy(discord.Client):
         if not channel_id:
             state.add_log("Member count: no channel configured")
             return
-        channel = guild.get_channel(int(channel_id)) or await guild.fetch_channel(int(channel_id))
-        if not channel:
-            state.add_log(f"Member count: channel {channel_id} not found")
-            return
+        channel = guild.get_channel(int(channel_id))
+        if channel is None:
+            try:
+                channel = await guild.fetch_channel(int(channel_id))
+            except discord.HTTPException:
+                state.add_log(f"Member count: channel {channel_id} not found")
+                return
         label = cfg.get("member_count_label") or "👥 Members: {count}"
         name = label.replace("{count}", str(guild.member_count))
         try:
             if channel.name != name:
                 await channel.edit(name=name, reason="Member count update")
                 state.add_log(f"Member count: renamed to '{name}'")
-            else:
-                state.add_log(f"Member count: already up to date ('{name}')")
         except Exception as e:
             state.add_log(f"Member count: failed to rename — {e}")
+
+    def schedule_member_count_update(self, guild, delay: float = 60):
+        """Update the member count soon, once, however many joins/leaves happen.
+
+        Discord only allows 2 channel renames per 10 minutes, so renaming on
+        every join during a raid would stall on the rate limit.
+        """
+        existing = self._member_count_tasks.get(guild.id)
+        if existing and not existing.done():
+            return
+
+        async def run():
+            await asyncio.sleep(delay)
+            await self.update_member_count(guild)
+
+        self._member_count_tasks[guild.id] = asyncio.create_task(run())
 
     async def backfill_join_roles(self, guild):
         """Reconcile the join role across the whole guild on startup.
@@ -247,6 +273,10 @@ class Floppy(discord.Client):
             except Exception:
                 pass
 
+            if guild.id in self._startup_done:
+                continue  # reconnect: data and roles were already reconciled
+            self._startup_done.add(guild.id)
+
             try:
                 await storage.load_all(guild)
                 # Make sure the XP table covers the whole roster first (adds any
@@ -264,8 +294,7 @@ class Floppy(discord.Client):
             except Exception as e:
                 state.add_log(f"Startup data load failed for {guild.name} (non-fatal): {e}")
 
-        state.add_log("Ticket panel views registered (panel NOT re-sent on boot)")
-        print(f"Online as {self.user}")
+        state.add_log("Startup complete")
 
     async def on_disconnect(self):
         state.add_log("Bot disconnected")
@@ -354,8 +383,8 @@ class Floppy(discord.Client):
             if role:
                 try:
                     await member.add_roles(role, reason="Auto join role")
-                except Exception:
-                    pass
+                except discord.HTTPException as e:
+                    state.add_log(f"Join role: failed to give {member} the join role — {e}")
 
         channel_id = cfg.get("welcome_channel")
         if channel_id:
@@ -378,11 +407,12 @@ class Floppy(discord.Client):
                 except discord.HTTPException:
                     state.add_log("Welcome message: failed to send (permissions/channel?)")
 
-        await self.update_member_count(member.guild)
+        self.schedule_member_count_update(member.guild)
         try:
             await levelling.ensure_member_present(member.guild, member.id)
         except Exception as e:
             state.add_log(f"Levelling: failed to add joiner to XP table — {e}")
+
     async def on_member_remove(self, member):
         if member.bot:
             return
@@ -414,7 +444,7 @@ class Floppy(discord.Client):
                 except discord.HTTPException:
                     state.add_log("Goodbye message: failed to send (permissions/channel?)")
 
-        await self.update_member_count(member.guild)
+        self.schedule_member_count_update(member.guild)
         state.add_log(f"Member left: {member}")
         await self.log(member.guild, make_embed(RED, "Member Left", fields=[
             ("Member", f"{member} ({member.id})", False),
@@ -675,15 +705,13 @@ class Floppy(discord.Client):
                 return  # Stop processing further for this message
         # =======================
 
-        # Delete any plain message in the commands channel — slash commands never
-        # trigger on_message, so every message here is a non-command and should go.
+        # Delete plain messages in the commands channel — slash commands never
+        # trigger on_message, so anything here is chatter. Admins are exempt.
         commands_ch_id = commands.get_commands_channel_id(cfg)
         if commands_ch_id and message.channel.id == commands_ch_id:
-            try:
-                await message.delete()
-            except discord.Forbidden:
-                pass
-            return
+            if not (isinstance(message.author, discord.Member) and commands.is_admin(message.author)):
+                await self.delete_quietly(message)
+                return
 
         if await self.handle_media_only(message, cfg):
             return
@@ -700,9 +728,9 @@ class Floppy(discord.Client):
         except discord.NotFound:
             return False
         except discord.Forbidden:
-            state.add_log(f"Honeypot: cannot delete message {message.id} — missing Manage Messages.")
+            state.add_log(f"Delete: cannot delete message {message.id} in #{message.channel} — missing Manage Messages.")
         except discord.HTTPException as e:
-            state.add_log(f"Honeypot: failed to delete message {message.id} — {e}")
+            state.add_log(f"Delete: failed to delete message {message.id} — {e}")
         return False
 
     async def resolve_isolation_role(self, guild: discord.Guild, cfg: dict):

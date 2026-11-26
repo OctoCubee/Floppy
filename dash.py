@@ -233,7 +233,7 @@ PAGE = r"""<!DOCTYPE html>
           <select id="join_role" data-src="roles"></select>
         </div>
         <div class="setting">
-          <div><div class="setting-title">Level 10 role</div><div class="setting-desc">At level 10 the join role is removed and this role is added instead.</div></div>
+          <div><div class="setting-title">Trusted role</div><div class="setting-desc">At level 5, or after 7 days in the server, the join role is removed and this role is added instead.</div></div>
           <select id="trust_role" data-src="roles"></select>
         </div>
       </div>
@@ -322,9 +322,10 @@ PAGE = r"""<!DOCTYPE html>
         <div class="card-head"><div><h2>How it works</h2></div></div>
         <ul class="facts">
           <li><strong>15–25 XP</strong> per message, at most once a minute.</li>
-          <li>Each level needs <code>5n² + 50n + 100</code> XP, so level 1 takes 155 and level 2 takes 310.</li>
+          <li>Reaching level <code>n</code> takes <code>5n² + 50n + 100</code> total XP, so level 1 takes 155 and level 5 takes 475.</li>
+          <li>Replying to someone gives you 15% more XP and gives them 8 XP.</li>
           <li>XP lives in <code>#floppystorage</code> on Discord; the bot keeps no database.</li>
-          <li>XP is wiped when a member leaves. Members check progress with <code>/rank</code>.</li>
+          <li>Members check progress with <code>/level</code> and the top 10 with <code>/levelboard</code>.</li>
         </ul>
       </div>
     </section>
@@ -334,7 +335,7 @@ PAGE = r"""<!DOCTYPE html>
       <div class="page-head"><h1>Member count</h1><p>Show a live member count in a voice channel name.</p></div>
       <div class="card">
         <div class="setting">
-          <div><div class="setting-title">Channel to rename</div><div class="setting-desc">Any voice channel. Updated on every join and leave, and every 10 minutes.</div></div>
+          <div><div class="setting-title">Channel to rename</div><div class="setting-desc">Any voice channel. Updated shortly after joins and leaves, and every 30 minutes. Discord only allows 2 renames per 10 minutes.</div></div>
           <select id="member_count_channel" data-src="voice_channels"></select>
         </div>
         <div class="setting stack">
@@ -364,7 +365,7 @@ PAGE = r"""<!DOCTYPE html>
 
     <!-- LOGS -->
     <section class="page" id="page-logs">
-      <div class="page-head"><h1>Live logs</h1><p>The bot's last 25 events, refreshed every 5 seconds.</p></div>
+      <div class="page-head"><h1>Live logs</h1><p>The bot's last 100 events, refreshed every 5 seconds.</p></div>
       <div class="card"><div class="logs" id="log-list"></div></div>
     </section>
 
@@ -599,6 +600,10 @@ async def get_config():
 @app.route("/api/config", methods=["POST"])
 async def set_config():
     data = await request.get_json()
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Expected a JSON object"}), 400
+    # Only accept known settings so a bad request can't write junk into config.
+    data = {k: v for k, v in data.items() if k in config.DEFAULTS}
     cfg = config.load()
     old_trust_role = cfg.get("trust_role")
     cfg.update(data)

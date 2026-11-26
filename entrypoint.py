@@ -1,15 +1,18 @@
 import asyncio
 import logging
+
+# Configure logging before importing the bot so import-time messages show up.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
 from hypercorn.config import Config
 from hypercorn.asyncio import serve
 from main import get_bot
 from dash import app
 from messenger import messenger_app
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
 log = logging.getLogger("floppy.entrypoint")
 
 # Mount messenger routes onto the main dash app under /messenger

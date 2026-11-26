@@ -1,20 +1,21 @@
 """
 storage.py — Discord-backed persistent storage for Floppy.
 
-Primary:  #floppystorage        — one permanent message per table, edited in-place on every write.
-                                  Never deleted, never duplicated.
-Backup:   #floppystoragebackup  — append-only log, NEVER deleted, each message has a
-                                  "↩ Restore" button that reinstates that snapshot as live data.
+Storage lives in #floppystorage — one permanent message per table, edited in-place.
+Never deleted, never duplicated.
+
+Writes update the in-memory cache straight away and are flushed to Discord in
+batches (at most once every FLUSH_DELAY seconds per table), so a busy chat
+doesn't turn every XP gain into a Discord API call.
 """
 
+import asyncio
 import io
 import json
-from datetime import datetime, timezone
 import discord
 import state
 
 STORAGE_CHANNEL_NAME = "floppystorage"
-BACKUP_CHANNEL_NAME  = "floppystoragebackup"
 
 # Tables that should always exist, even before any data is written.
 KNOWN_TABLES = ["levelling", "warnings"]
@@ -24,68 +25,21 @@ _cache: dict[str, dict] = {}
 
 # Cached channel objects.
 _channel: discord.TextChannel | None = None
-_backup_channel: discord.TextChannel | None = None
 
 # Live message reference per table — fetched once on startup, then edited forever.
 _live_msgs: dict[str, discord.Message] = {}
 
+# Batched writes: how long to wait before pushing a changed table to Discord.
+FLUSH_DELAY = 15
+_pending: dict[str, asyncio.Task] = {}
+_pending_guild: dict[str, discord.Guild] = {}
+_locks: dict[str, asyncio.Lock] = {}
 
-# ---------------------------------------------------------------------------
-# Backup restore button
-# ---------------------------------------------------------------------------
 
-class RestoreBackupButton(discord.ui.View):
-    """
-    Persistent button attached to every backup message.
-    custom_id encodes the table name so it survives bot restarts.
-    """
-
-    def __init__(self, table: str):
-        super().__init__(timeout=None)
-        self.table = table
-
-        button = discord.ui.Button(
-            label="↩ Restore this backup",
-            style=discord.ButtonStyle.danger,
-            custom_id=f"floppy_restore:{table}",
-        )
-        button.callback = self.restore_callback
-        self.add_item(button)
-
-    async def restore_callback(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "❌ Only admins can restore backups.", ephemeral=True
-            )
-            return
-
-        msg = interaction.message
-        if not msg.attachments:
-            await interaction.response.send_message(
-                "❌ No attachment found on this message.", ephemeral=True
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            raw = await msg.attachments[0].read()
-            data = json.loads(raw.decode("utf-8"))
-        except Exception as e:
-            await interaction.followup.send(f"❌ Failed to read backup: {e}", ephemeral=True)
-            return
-
-        await write(interaction.guild, self.table, data)
-
-        state.add_log(
-            f"Storage: '{self.table}' restored from backup by {interaction.user} "
-            f"(msg {msg.id})"
-        )
-        await interaction.followup.send(
-            f"✅ `{self.table}` restored from backup ({len(data)} entries). "
-            f"A new backup snapshot has been posted.",
-            ephemeral=True,
-        )
+def _lock(table: str) -> asyncio.Lock:
+    if table not in _locks:
+        _locks[table] = asyncio.Lock()
+    return _locks[table]
 
 
 # ---------------------------------------------------------------------------
@@ -127,14 +81,6 @@ async def _get_or_create_storage_channel(guild: discord.Guild) -> discord.TextCh
     return _channel
 
 
-async def _get_or_create_backup_channel(guild: discord.Guild) -> discord.TextChannel | None:
-    global _backup_channel
-    if _backup_channel and _backup_channel.guild.id == guild.id:
-        return _backup_channel
-    _backup_channel = await _get_or_create_channel(guild, BACKUP_CHANNEL_NAME)
-    return _backup_channel
-
-
 async def _find_table_message(channel: discord.TextChannel, table: str) -> discord.Message | None:
     """Scan #floppystorage for the one permanent message belonging to this table."""
     try:
@@ -159,24 +105,6 @@ async def _ensure_pinned(msg: discord.Message):
     except discord.HTTPException as e:
         # Pin limit (50) reached or missing perms — not worth failing a write over.
         state.add_log(f"Storage: couldn't pin '{msg.id}' — {e}")
-
-
-async def _post_backup(guild: discord.Guild, table: str, data: dict):
-    """Append a snapshot to #floppystoragebackup. Never called if backup channel is unavailable."""
-    backup_channel = await _get_or_create_backup_channel(guild)
-    if not backup_channel:
-        return
-    try:
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        raw = json.dumps(data, indent=2).encode("utf-8")
-        file = discord.File(io.BytesIO(raw), filename=f"{table}.json")
-        await backup_channel.send(
-            content=f"📦 `{table}` backup — {len(data)} entries — {ts}",
-            file=file,
-            view=RestoreBackupButton(table),
-        )
-    except Exception as e:
-        state.add_log(f"Storage: failed to post backup for '{table}' — {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -209,14 +137,64 @@ async def read(guild: discord.Guild, table: str) -> dict:
         return _cache.get(table, {})
 
 
-async def write(guild: discord.Guild, table: str, data: dict):
-    """Persist a table to #floppystorage (edit-in-place) and snapshot to #floppystoragebackup.
+async def write(guild: discord.Guild, table: str, data: dict, *, immediate: bool = False):
+    """Update a table and persist it to #floppystorage.
+
+    The cache is updated straight away. The Discord write is batched: it runs
+    FLUSH_DELAY seconds after the first change, carrying every change made in
+    the meantime. Pass immediate=True for data that must hit Discord now.
+    """
+    _cache[table] = data
+    _pending_guild[table] = guild
+
+    if immediate:
+        task = _pending.pop(table, None)
+        if task and not task.done():
+            task.cancel()
+        await _flush(table)
+        return
+
+    task = _pending.get(table)
+    if task is None or task.done():
+        _pending[table] = asyncio.create_task(_delayed_flush(table))
+
+
+async def _delayed_flush(table: str):
+    try:
+        await asyncio.sleep(FLUSH_DELAY)
+    except asyncio.CancelledError:
+        return
+    _pending.pop(table, None)
+    await _flush(table)
+
+
+async def flush_all():
+    """Write every table with unsaved changes right now (used on shutdown)."""
+    for table, task in list(_pending.items()):
+        if not task.done():
+            task.cancel()
+        _pending.pop(table, None)
+        await _flush(table)
+
+
+async def _flush(table: str):
+    guild = _pending_guild.get(table)
+    if guild is None or table not in _cache:
+        return
+    async with _lock(table):
+        try:
+            await _write_now(guild, table, _cache[table])
+        except Exception as e:
+            state.add_log(f"Storage: unexpected error writing '{table}' — {e}")
+
+
+async def _write_now(guild: discord.Guild, table: str, data: dict):
+    """Persist a table to #floppystorage (edit-in-place).
 
     If a live message already exists for this table it is EDITED, never replaced.
     A new message is only posted the very first time (no existing message found).
     This prevents duplicate messages entirely.
     """
-    _cache[table] = data
 
     channel = await _get_or_create_storage_channel(guild)
     if not channel:
@@ -249,8 +227,11 @@ async def write(guild: discord.Guild, table: str, data: dict):
         except Exception as e:
             state.add_log(f"Storage: couldn't merge existing '{table}', writing as-is — {e}")
 
-    # Cache + outgoing payload reflect the merged result.
-    _cache[table] = data
+    # Bring any keys recovered from the stored copy back into the cache. Don't
+    # replace the cache wholesale: writes made while we awaited above live there.
+    current = _cache.setdefault(table, {})
+    for key, value in data.items():
+        current.setdefault(key, value)
     raw = json.dumps(data, indent=2).encode("utf-8")
     content_text = f"`{table}` — {len(data)} entries"
 
@@ -285,9 +266,6 @@ async def write(guild: discord.Guild, table: str, data: dict):
             state.add_log(f"Storage: failed to create message for '{table}' — {e}")
             return
 
-    # Always append a backup snapshot regardless of whether we edited or created.
-    await _post_backup(guild, table, data)
-
 
 def get_cached(table: str) -> dict:
     """Fast in-memory read — use this during normal operation."""
@@ -304,13 +282,11 @@ def set_cached(table: str, data: dict):
 # ---------------------------------------------------------------------------
 
 async def load_all(guild: discord.Guild):
-    """Ensure both storage channels exist, then load all known tables."""
+    """Ensure the storage channel exists, then load all known tables."""
     channel = await _get_or_create_storage_channel(guild)
     if not channel:
         state.add_log("Storage: startup aborted — could not get/create storage channel")
         return
-
-    await _get_or_create_backup_channel(guild)
 
     for table in KNOWN_TABLES:
         await read(guild, table)

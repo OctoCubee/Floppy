@@ -2,7 +2,7 @@
 warns.py — warning records for Floppy, persisted to Discord via storage.py.
 
 Mirrors levelling.py's storage pattern: a single `warnings` table lives as one
-permanent message in #floppystorage (edited in-place, backed up). The shape is
+permanent message in #floppystorage (edited in-place). The shape is
 keyed by the warned user's ID:
 
     {
@@ -51,5 +51,6 @@ async def add_warning(
     })
     data[key] = user_warnings
     storage.set_cached(TABLE, data)
-    await storage.write(guild, TABLE, data)
+    # Warnings are rare and important, so skip the batching delay.
+    await storage.write(guild, TABLE, data, immediate=True)
     return user_warnings

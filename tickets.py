@@ -1,12 +1,41 @@
 import discord
 import io
 import config
+import state
 from datetime import datetime, timezone
 
 PANEL_MESSAGE_KEY = "ticket_panel_message_id"
 
 def format_timestamp():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def get_opener_id(channel) -> int | None:
+    """Read the opener's user ID from a ticket channel's topic."""
+    topic = getattr(channel, "topic", None)
+    if not topic or "opener:" not in topic:
+        return None
+    try:
+        return int(topic.split("opener:")[1].split(" |")[0].strip())
+    except (IndexError, ValueError):
+        return None
+
+
+def is_ticket_staff(member, cfg: dict) -> bool:
+    staff_role_ids = {str(x) for x in cfg.get("ticket_staff_roles", [])}
+    return any(str(r.id) in staff_role_ids for r in getattr(member, "roles", []))
+
+
+def find_open_ticket(guild: discord.Guild, user_id: int):
+    """Find a user's open ticket by the opener ID in its topic.
+
+    Matching by channel name breaks once other users are added and the
+    channel is renamed (ticket-alice-bob), which let people open duplicates.
+    """
+    for channel in guild.text_channels:
+        if channel.name.startswith("ticket-") and get_opener_id(channel) == user_id:
+            return channel
+    return None
 
 # ── Views ────────────────────────────────────────────────────────────────────
 
@@ -35,7 +64,7 @@ class TicketModal(discord.ui.Modal, title="Open a Ticket"):
         member = interaction.user
 
         # Check if user already has an open ticket
-        existing = discord.utils.get(guild.text_channels, name=f"ticket-{member.name.lower()}")
+        existing = find_open_ticket(guild, member.id)
         if existing:
             await interaction.followup.send(f"You already have an open ticket: {existing.mention}", ephemeral=True)
             return
@@ -58,12 +87,20 @@ class TicketModal(discord.ui.Modal, title="Open a Ticket"):
             if role:
                 overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
 
-        channel = await guild.create_text_channel(
-            name=f"ticket-{member.name.lower()}",
-            category=category,
-            overwrites=overwrites,
-            topic=f"Ticket by {member} | opener:{member.id} | Reason: {self.reason.value}",
-        )
+        try:
+            channel = await guild.create_text_channel(
+                name=f"ticket-{member.name.lower()}",
+                category=category,
+                overwrites=overwrites,
+                # Topics max out at 1024 characters.
+                topic=f"Ticket by {member} | opener:{member.id} | Reason: {self.reason.value}"[:1024],
+            )
+        except discord.HTTPException as e:
+            await interaction.followup.send(
+                "❌ Couldn't create your ticket. Please let a staff member know.", ephemeral=True
+            )
+            state.add_log(f"Tickets: failed to create ticket for {member} — {e}")
+            return
 
         # Panel embed at top
         e = discord.Embed(
@@ -92,17 +129,9 @@ class TicketPanelView(discord.ui.View):
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="ticket:close")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         cfg = config.load()
-        staff_role_ids = cfg.get("ticket_staff_roles", [])
-        is_staff = any(str(r.id) in [str(x) for x in staff_role_ids] for r in interaction.user.roles)
+        is_staff = is_ticket_staff(interaction.user, cfg)
         channel = interaction.channel
-
-        # Get opener id from channel topic
-        opener_id = None
-        if channel.topic:
-            try:
-                opener_id = int(channel.topic.split("opener:")[1].split(" |")[0].strip())
-            except Exception:
-                pass
+        opener_id = get_opener_id(channel)
 
         is_opener = interaction.user.id == opener_id
 
@@ -132,7 +161,6 @@ class TicketPanelView(discord.ui.View):
         dm_errors = []
 
         # Figure out which members were individually added (not opener, not bot, not staff role)
-        staff_role_ids = cfg.get("ticket_staff_roles", [])
         added_members = []
         for target, overwrite in list(channel.overwrites.items()):
             if not isinstance(target, discord.Member):
@@ -142,8 +170,7 @@ class TicketPanelView(discord.ui.View):
             if opener_id and target.id == opener_id:
                 continue
             # Skip anyone whose access comes purely from a staff role
-            has_staff_role = any(str(r.id) in [str(x) for x in staff_role_ids] for r in target.roles)
-            if has_staff_role:
+            if is_ticket_staff(target, cfg):
                 continue
             if overwrite.view_channel:
                 added_members.append(target)
@@ -231,10 +258,7 @@ class TicketPanelView(discord.ui.View):
 
     @discord.ui.button(label="Claim", style=discord.ButtonStyle.success, emoji="👤", custom_id="ticket:claim")
     async def claim_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cfg = config.load()
-        staff_role_ids = cfg.get("ticket_staff_roles", [])
-        is_staff = any(str(r.id) in [str(x) for x in staff_role_ids] for r in interaction.user.roles)
-        if not is_staff:
+        if not is_ticket_staff(interaction.user, config.load()):
             await interaction.response.send_message("Only staff can claim tickets.", ephemeral=True)
             return
 
@@ -250,10 +274,7 @@ class TicketPanelView(discord.ui.View):
 
     @discord.ui.button(label="Ticket Actions", style=discord.ButtonStyle.secondary, emoji="⚙️", custom_id="ticket:actions")
     async def ticket_actions(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cfg = config.load()
-        staff_role_ids = cfg.get("ticket_staff_roles", [])
-        is_staff = any(str(r.id) in [str(x) for x in staff_role_ids] for r in interaction.user.roles)
-        if not is_staff:
+        if not is_ticket_staff(interaction.user, config.load()):
             await interaction.response.send_message("Only staff can use ticket actions.", ephemeral=True)
             return
         await interaction.response.send_message(
@@ -374,12 +395,7 @@ class RemoveUsersModal(discord.ui.Modal, title="Remove Users from Ticket"):
         guild = interaction.guild
 
         # Protect the opener from being removed
-        opener_id = None
-        if channel.topic:
-            try:
-                opener_id = int(channel.topic.split("opener:")[1].split(" |")[0].strip())
-            except Exception:
-                pass
+        opener_id = get_opener_id(channel)
 
         raw_ids = [s.strip() for s in self.user_ids.value.split(",") if s.strip()]
         removed, protected, not_found, errors = [], [], [], []
@@ -435,16 +451,11 @@ class RemoveUsersModal(discord.ui.Modal, title="Remove Users from Ticket"):
 
 async def _rename_ticket_channel(channel: discord.TextChannel, guild: discord.Guild):
     """Rebuild the ticket channel name from opener + all explicitly added members."""
-    opener_id = None
     opener_name = channel.name.removeprefix("ticket-")
-    if channel.topic:
-        try:
-            opener_id = int(channel.topic.split("opener:")[1].split(" |")[0].strip())
-            opener_member = guild.get_member(opener_id)
-            if opener_member:
-                opener_name = opener_member.name.lower()
-        except Exception:
-            pass
+    opener_id = get_opener_id(channel)
+    opener_member = guild.get_member(opener_id) if opener_id else None
+    if opener_member:
+        opener_name = opener_member.name.lower()
 
     added_names = []
     for target, overwrite in channel.overwrites.items():
@@ -489,11 +500,7 @@ async def handle_ticket_mention(message: discord.Message):
     if message.author.bot or not message.mentions:
         return
 
-    cfg = config.load()
-    staff_role_ids = [str(r) for r in cfg.get("ticket_staff_roles", [])]
-    author_role_ids = [str(r.id) for r in message.author.roles]
-    is_staff = any(rid in staff_role_ids for rid in author_role_ids)
-    if not is_staff:
+    if not is_ticket_staff(message.author, config.load()):
         return
 
     guild = channel.guild

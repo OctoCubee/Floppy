@@ -1,5 +1,10 @@
+import copy
 import json
+import logging
 import os
+import tempfile
+
+log = logging.getLogger("floppy.config")
 
 CONFIG_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "config.json")
 
@@ -34,21 +39,56 @@ DEFAULTS = {
     # NOTE: XP data is stored in Discord (#floppystorage), not here.
 }
 
-def load():
-    if not os.path.exists(CONFIG_FILE):
-        save(DEFAULTS.copy())
-        return DEFAULTS.copy()
-    with open(CONFIG_FILE, "r") as f:
-        data = json.load(f)
+# Config is read on nearly every event, so keep a parsed copy and only re-read
+# the file when it changes on disk.
+_cache: dict | None = None
+_cache_mtime: float | None = None
+
+
+def _normalise(data: dict) -> dict:
     for k, v in DEFAULTS.items():
         if k not in data:
-            data[k] = v
+            data[k] = copy.deepcopy(v)
     # Migrate the old single media_channel setting to the media_channels list.
     legacy = data.pop("media_channel", None)
     if legacy and not data["media_channels"]:
         data["media_channels"] = [legacy]
     return data
 
+
+def load() -> dict:
+    """Return a fresh copy of the config; callers may mutate it freely."""
+    global _cache, _cache_mtime
+    if not os.path.exists(CONFIG_FILE):
+        save(copy.deepcopy(DEFAULTS))
+    mtime = os.path.getmtime(CONFIG_FILE)
+    if _cache is None or mtime != _cache_mtime:
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            log.error("config.json could not be read (%s); using last good config", e)
+            data = _cache if _cache is not None else copy.deepcopy(DEFAULTS)
+        _cache = _normalise(data)
+        _cache_mtime = mtime
+    return copy.deepcopy(_cache)
+
+
 def save(data: dict):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    """Write atomically so a crash mid-save can't leave a half-written file."""
+    global _cache, _cache_mtime
+    directory = os.path.dirname(CONFIG_FILE) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".config-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, CONFIG_FILE)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    _cache = None
+    _cache_mtime = None

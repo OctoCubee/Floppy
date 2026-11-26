@@ -6,7 +6,7 @@ A panel of buttons (persistent view) that exposes staff actions:
   • 📋 View Warns   — pick a member, see their warning history
   • 🏓 Ping         — quick latency check
 
-Warnings are stored on Discord through warnings.py (table "warnings"), exactly
+Warnings are stored on Discord through warns.py (table "warnings"), exactly
 like levelling — keyed by the warned user's ID.
 
 All views are persistent (timeout=None, fixed custom_ids) so the buttons keep
@@ -14,9 +14,10 @@ working after a bot restart. They're registered in main.py's setup_hook.
 """
 
 import discord
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import config
 import levelling
+import state
 import warns
 
 PANEL_COLOR = 0x5865f2
@@ -59,6 +60,19 @@ async def _guard_admin(interaction: discord.Interaction) -> bool:
         "❌ Only admins can use this.", ephemeral=True
     )
     return False
+
+
+async def _audit(interaction: discord.Interaction, title: str, fields: list[tuple[str, str, bool]]):
+    """Record a staff action in the audit log channel."""
+    e = discord.Embed(title=title, color=PANEL_COLOR, timestamp=datetime.now(timezone.utc))
+    e.add_field(name="Staff", value=f"{interaction.user.mention} ({interaction.user})", inline=True)
+    for name, value, inline in fields:
+        e.add_field(name=name, value=value[:1024], inline=inline)
+    e.set_footer(text=f"Staff ID: {interaction.user.id}")
+    log = getattr(interaction.client, "log", None)
+    if log:
+        await log(interaction.guild, e)
+    state.add_log(f"Staff: {title} by {interaction.user}")
 
 
 def panel_embed() -> discord.Embed:
@@ -214,6 +228,12 @@ class WarnReasonModal(discord.ui.Modal, title="Warn Member"):
         embed.set_thumbnail(url=self.member.display_avatar.url)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+        await _audit(interaction, "⚠️ Member Warned", [
+            ("Member", f"{self.member.mention} ({self.member})", True),
+            ("Total Warnings", str(count), True),
+            ("Reason", self.reason.value, False),
+        ])
+
         # Best-effort DM to the warned member.
         try:
             dm = discord.Embed(
@@ -258,7 +278,6 @@ class ViewWarnsMemberSelectView(discord.ui.View):
             when = ""
             ts = w.get("timestamp", "")
             try:
-                from datetime import datetime
                 dt = datetime.fromisoformat(ts)
                 when = f" · <t:{int(dt.timestamp())}:R>"
             except (ValueError, TypeError):
@@ -267,9 +286,15 @@ class ViewWarnsMemberSelectView(discord.ui.View):
             mod = f"<@{mod_id}>" if mod_id else "Unknown"
             lines.append(f"`#{i}` {w.get('reason', 'No reason')} — by {mod}{when}")
 
+        # Embed descriptions cap at 4096 characters; keep the newest warnings.
+        description = "\n".join(lines)
+        while len(description) > 4000 and len(lines) > 1:
+            lines.pop(0)
+            description = "… older warnings hidden …\n" + "\n".join(lines)
+
         embed = discord.Embed(
             title=f"⚠️ Warnings for {member.display_name}",
-            description="\n".join(lines),
+            description=description,
             color=WARN_COLOR,
         )
         embed.set_footer(text=f"{len(user_warnings)} total")
@@ -313,34 +338,58 @@ class PurgeModal(discord.ui.Modal, title="Purge Messages"):
                 "❌ Couldn't find that message in this channel.", ephemeral=True
             )
             return
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"❌ Couldn't fetch that message: {e}", ephemeral=True)
+            return
 
         to_delete = [anchor]
         async for msg in self.channel.history(limit=None, after=anchor, oldest_first=True):
             to_delete.append(msg)
 
-        if not to_delete:
-            await interaction.followup.send("Nothing to delete.", ephemeral=True)
-            return
+        # Keep the purge out of the per-message audit log; one summary entry
+        # is posted below instead.
+        bot = interaction.client
+        if hasattr(bot, "suppress_delete_log"):
+            for m in to_delete:
+                bot.suppress_delete_log(m.id)
 
         cutoff = discord.utils.utcnow() - timedelta(days=14)
         bulk = [m for m in to_delete if m.created_at > cutoff]
         slow = [m for m in to_delete if m.created_at <= cutoff]
         deleted = 0
+        error = None
 
-        for i in range(0, len(bulk), 100):
-            chunk = bulk[i:i + 100]
-            if len(chunk) == 1:
-                await chunk[0].delete()
-            else:
-                await self.channel.delete_messages(chunk)
-            deleted += len(chunk)
+        try:
+            for i in range(0, len(bulk), 100):
+                chunk = bulk[i:i + 100]
+                if len(chunk) == 1:
+                    await chunk[0].delete()
+                else:
+                    await self.channel.delete_messages(chunk)
+                deleted += len(chunk)
 
-        for msg in slow:
-            try:
-                await msg.delete()
-                deleted += 1
-            except discord.NotFound:
-                pass
+            for msg in slow:
+                try:
+                    await msg.delete()
+                    deleted += 1
+                except discord.NotFound:
+                    pass
+        except discord.Forbidden:
+            error = "I don't have permission to delete messages here."
+        except discord.HTTPException as e:
+            error = str(e)
+
+        if deleted:
+            await _audit(interaction, "🗑️ Messages Purged", [
+                ("Channel", self.channel.mention, True),
+                ("Deleted", str(deleted), True),
+            ])
+
+        if error:
+            await interaction.followup.send(
+                f"⚠️ Stopped after deleting **{deleted}** message(s): {error}", ephemeral=True
+            )
+            return
 
         await interaction.followup.send(
             f"🗑️ Deleted **{deleted}** message(s).", ephemeral=True
@@ -403,6 +452,7 @@ class SetLevelModal(discord.ui.Modal, title="Set Level"):
         await interaction.response.defer(ephemeral=True)
 
         cfg = config.load()
+        old_level = levelling.level_for_xp(levelling.get_user_xp(self.member.id))
         await levelling._set_user_xp(interaction.guild, self.member.id, new_xp)
 
         # Keep the trust role in sync with the new value
@@ -418,3 +468,8 @@ class SetLevelModal(discord.ui.Modal, title="Set Level"):
         embed.add_field(name="Progress", value=f"{xp_into}/{xp_needed} XP", inline=False)
         embed.set_thumbnail(url=self.member.display_avatar.url)
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+        await _audit(interaction, "📈 Level Set", [
+            ("Member", f"{self.member.mention} ({self.member})", True),
+            ("Level", f"{old_level} → {lv}", True),
+        ])
